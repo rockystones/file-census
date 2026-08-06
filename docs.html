@@ -116,12 +116,18 @@ warning instead of closing.</td></tr>
 <tr><td>suggest_db_name(drives)</td>
 <td>The default catalog name: <code>census_&lt;letters&gt;_drive_&lt;YYYYMMDDHHMM&gt;.sqlite</code>
 — selected drive letters joined, plus local wall-clock minutes.</td></tr>
-<tr><td>summarize_scan(con, scan_id, top_n) / write_summary(…)</td>
+<tr><td>summarize_scan(con, scan_id) / write_summary(…)</td>
 <td>After scanning, one in-memory pass over the scan's rows rolls up each root-level entry:
 recursive size and file count, its major file types with counts, and subfolder counts per
 level. <code>write_summary</code> renders that plus the overall stats into a
-<code>.txt</code> preview next to the catalog (same name stem); roots beyond the
-<code>--top</code> largest are omitted with a note.</td></tr>
+<code>.txt</code> preview next to the catalog (same name stem). The cap keeps the
+<code>--top</code> largest roots; display order then follows the sort spec (below), and
+omissions are noted.</td></tr>
+<tr><td>parse_sort(spec)</td>
+<td>Parses the multi-key sort — <code>"size:desc,type:asc,name:asc"</code> (the default) —
+into ordered (key, descending) pairs. The GUI exposes the same thing as three priority
+slots (key + direction dropdowns); the table is then sorted by chained stable sorts,
+least-significant key first, so mixed directions compose correctly.</td></tr>
 <tr><td>open_db(path)</td>
 <td>Opens/creates the SQLite file and applies the schema (all <code>CREATE IF NOT
 EXISTS</code>, so pointing at an existing catalog is a no-op and new scans append).</td></tr>
