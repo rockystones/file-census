@@ -57,6 +57,23 @@ orders what is shown, and the section header records which sort was used.
 Each run adds a new `scan` row per drive — history accumulates in one catalog,
 so two scans of the same drive can be compared later.
 
+## Browsing a catalog: qcview.py
+
+```
+python qcview.py                     # file-open dialog
+python qcview.py census_E_drive_202608061920.sqlite
+```
+
+A read-only, File-Explorer-style browser over any qc.py catalog: expandable
+tree with Type / Modified / Size / Items columns (folder sizes and item counts
+are recursive), a scan picker when the catalog holds several scans, and the
+full path of the selection in the status bar. For dense listings it collapses
+sibling files or folders whose names differ only in digit runs into one
+pattern row — `≡ cv_eis_16ch(#).nox ×11` — expandable on click; digit runs
+identical across the whole family stay literal, only the varying ones become
+`#`. The "Collapse similar names ≥ N" toggle and threshold control it
+(default ≥ 5).
+
 ## Catalog schema (SQLite)
 
 - `scan` — one row per drive per run: label, fs, serial, disk totals, timings,
