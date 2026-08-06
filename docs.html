@@ -105,12 +105,23 @@ time; UTC timestamps in ISO form for the scan bookkeeping rows.</td></tr>
 <tr><td>volume_info(root)</td>
 <td>ctypes wrapper returning <code>(label, fs_type, serial_hex)</code> for one drive root, or
 <code>None</code>s if the query fails (empty CD drive, etc.).</td></tr>
-<tr><td>pick_drives_gui(drives, default_db)</td>
+<tr><td>pick_drives_gui(drives, explicit_db, auto_dir)</td>
 <td>Builds the dialog and blocks until the user acts. Returns a 3-tuple:
-the ticked drive letters, the catalog file path (typed or browsed, custom name welcome), and
-whether "allow catalog on a scanned drive" was ticked. Cancel returns an empty drive list.
-Validation runs <em>inside</em> the dialog: no drives ticked, or a catalog placed on a
-drive about to be scanned, pops a warning instead of closing.</td></tr>
+the ticked drive letters, the catalog file path, and whether "allow catalog on a scanned
+drive" was ticked. Unless <code>--db</code> pinned a path, the catalog field live-updates
+the suggested name as drives are ticked, and stops the moment the user types or browses
+their own value. Cancel returns an empty drive list. Validation runs <em>inside</em> the
+dialog: no drives ticked, or a catalog placed on a drive about to be scanned, pops a
+warning instead of closing.</td></tr>
+<tr><td>suggest_db_name(drives)</td>
+<td>The default catalog name: <code>census_&lt;letters&gt;_drive_&lt;YYYYMMDDHHMM&gt;.sqlite</code>
+— selected drive letters joined, plus local wall-clock minutes.</td></tr>
+<tr><td>summarize_scan(con, scan_id, top_n) / write_summary(…)</td>
+<td>After scanning, one in-memory pass over the scan's rows rolls up each root-level entry:
+recursive size and file count, its major file types with counts, and subfolder counts per
+level. <code>write_summary</code> renders that plus the overall stats into a
+<code>.txt</code> preview next to the catalog (same name stem); roots beyond the
+<code>--top</code> largest are omitted with a note.</td></tr>
 <tr><td>open_db(path)</td>
 <td>Opens/creates the SQLite file and applies the schema (all <code>CREATE IF NOT
 EXISTS</code>, so pointing at an existing catalog is a no-op and new scans append).</td></tr>
@@ -286,13 +297,16 @@ of flat paths exists at query time without paying its storage cost. Always filte
         drives, db_path, allow = GUI dialog           # checkboxes + catalog field
         if user cancelled: exit
 
+    if no db path chosen:
+        db_path = census_&lt;letters&gt;_drive_&lt;timestamp&gt;.sqlite   # beside qc.py
     if db_path sits on any drive in drives and not allow:
         refuse and exit                               # the read-only promise
 
     con  = open_db(db_path)                           # creates tables/view if new
     skip = { db_path, db_path-wal, db_path-shm }      # never census our own output
     for drive in drives:
-        scan_drive(con, drive, skip)
+        scan_ids += scan_drive(con, drive, skip)
+    write_summary(con, scan_ids, db_path.txt)         # stats + root-level structure table
 
 
 scan_drive(con, drive, skip):
