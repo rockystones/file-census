@@ -135,9 +135,11 @@ def detect_drives() -> list[dict]:
     return out
 
 
-def pick_drives_gui(drives: list[dict]) -> list[str]:
+def pick_drives_gui(drives: list[dict], default_db: str) -> tuple[list[str], str, bool]:
+    """Returns (picked_drives, db_path, allow_db_on_scanned). Empty list = cancelled."""
     try:
         import tkinter as tk
+        from tkinter import filedialog, messagebox
     except ImportError:
         print("tkinter unavailable — pass drive letters on the command line (see --help)",
               file=sys.stderr)
@@ -155,10 +157,51 @@ def pick_drives_gui(drives: list[dict]) -> list[str]:
         state = "normal" if d["type"] in ("fixed", "removable", "ramdisk") else "disabled"
         tk.Checkbutton(root, text=text, variable=v, anchor="w", padx=16, state=state).pack(fill="x")
         vars_by_drive[d["drive"]] = v
+
+    # catalog destination: editable path (custom name welcome) + file dialog
+    dest = tk.Frame(root)
+    dest.pack(fill="x", padx=12, pady=(10, 0))
+    tk.Label(dest, text="Catalog file:").pack(side="left")
+    db_var = tk.StringVar(value=default_db)
+    tk.Entry(dest, textvariable=db_var, width=64).pack(side="left", fill="x", expand=True, padx=6)
+
+    def browse():
+        cur = db_var.get().strip() or default_db
+        chosen = filedialog.asksaveasfilename(
+            parent=root, title="Save catalog as",
+            initialdir=os.path.dirname(os.path.abspath(cur)) or ".",
+            initialfile=os.path.basename(cur) or "census.sqlite",
+            defaultextension=".sqlite",
+            filetypes=[("SQLite catalog", "*.sqlite"), ("All files", "*.*")],
+            confirmoverwrite=False)  # appending to an existing catalog is normal
+        if chosen:
+            db_var.set(chosen)
+
+    tk.Button(dest, text="Browse…", command=browse).pack(side="left")
+    allow_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(root, text="Allow the catalog to live on a scanned drive "
+                              "(the catalog file itself is excluded from the census)",
+                   variable=allow_var, anchor="w", padx=16).pack(fill="x", pady=(2, 0))
+
     picked: list[str] = []
+    result = {"db": default_db, "allow": False}
 
     def go():
-        picked.extend(k for k, v in vars_by_drive.items() if v.get())
+        sel = [k for k, v in vars_by_drive.items() if v.get()]
+        if not sel:
+            messagebox.showwarning("quick census", "No drives selected.", parent=root)
+            return
+        dbp = os.path.abspath(db_var.get().strip() or default_db)
+        if os.path.splitdrive(dbp)[0].upper() in {d.upper() for d in sel} and not allow_var.get():
+            messagebox.showwarning(
+                "quick census",
+                f"The catalog file\n\n{dbp}\n\nis on a drive you are about to scan.\n"
+                "Pick another location, or tick the allow checkbox to accept that one "
+                "file being written there.", parent=root)
+            return
+        picked.extend(sel)
+        result["db"] = dbp
+        result["allow"] = allow_var.get()
         root.destroy()
 
     row = tk.Frame(root)
@@ -166,7 +209,7 @@ def pick_drives_gui(drives: list[dict]) -> list[str]:
     tk.Button(row, text="Scan", width=12, command=go).pack(side="left", padx=6)
     tk.Button(row, text="Cancel", width=12, command=root.destroy).pack(side="left", padx=6)
     root.mainloop()
-    return picked
+    return picked, result["db"], result["allow"]
 
 
 def iso_now() -> str:
@@ -327,10 +370,12 @@ def main(argv=None) -> int:
                 return 2
             drives.append(d)
     else:
-        drives = pick_drives_gui(infos)
+        drives, gui_db, gui_allow = pick_drives_gui(infos, args.db)
         if not drives:
             print("nothing selected")
             return 0
+        args.db = gui_db
+        args.allow_db_on_scanned = args.allow_db_on_scanned or gui_allow
 
     db_path = os.path.abspath(args.db)
     db_drive = os.path.splitdrive(db_path)[0].upper()
