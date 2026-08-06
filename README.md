@@ -31,12 +31,21 @@ python qc.py --list        # show detected drives
 python qc.py E: --db D:\catalogs\home.sqlite
 ```
 
-The popup includes a **Catalog file** field (type any path/name, or Browse…) so
-each census can go to its own database; it defaults to `census.sqlite` beside
-qc.py, or to `--db` if you passed one. Choosing a location on a drive you are
+The default catalog name encodes the selection and the moment:
+`census_E_drive_202608061920.sqlite` (letters of the chosen drives + local
+`YYYYMMDDHHMM`), created beside qc.py. In the popup the **Catalog file** field
+live-updates this suggestion as you tick drives — until you type or Browse… to
+your own path, which pins your choice. Choosing a location on a drive you are
 about to scan warns immediately — tick the allow checkbox to accept it (the
 catalog file itself is then excluded from the census). Pointing at an existing
 catalog appends a new scan to it rather than overwriting.
+
+Each run also writes a **summary preview** next to the catalog
+(`census_E_drive_202608061920.txt`): overall stats + top file types, unreadable
+paths, and a root-level structure table — one row per first-level folder/file
+with recursive size, date, its major file types with counts, and subfolder
+counts per level (`lv2:13 lv3:58 …`) so drive depth/width is visible at a
+glance. Roots beyond the `--top` largest (default 100) are omitted with a note.
 
 Each run adds a new `scan` row per drive — history accumulates in one catalog,
 so two scans of the same drive can be compared later.
