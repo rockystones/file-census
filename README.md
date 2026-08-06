@@ -25,11 +25,18 @@ Intended for non-sensitive drives where filenames are not a privacy concern.
 ## Usage
 
 ```
-python qc.py               # popup: tick the drives, click Scan
+python qc.py               # popup: tick drives, set the catalog path/name, Scan
 python qc.py C: E:         # no popup
 python qc.py --list        # show detected drives
 python qc.py E: --db D:\catalogs\home.sqlite
 ```
+
+The popup includes a **Catalog file** field (type any path/name, or Browse…) so
+each census can go to its own database; it defaults to `census.sqlite` beside
+qc.py, or to `--db` if you passed one. Choosing a location on a drive you are
+about to scan warns immediately — tick the allow checkbox to accept it (the
+catalog file itself is then excluded from the census). Pointing at an existing
+catalog appends a new scan to it rather than overwriting.
 
 Each run adds a new `scan` row per drive — history accumulates in one catalog,
 so two scans of the same drive can be compared later.
