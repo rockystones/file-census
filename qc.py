@@ -136,8 +136,31 @@ def detect_drives() -> list[dict]:
     return out
 
 
-def pick_drives_gui(drives: list[dict], explicit_db: str | None, auto_dir: str) -> tuple[list[str], str, bool]:
-    """Returns (picked_drives, db_path, allow_db_on_scanned). Empty list = cancelled.
+DEFAULT_SORT = "size:desc,type:asc,name:asc"
+SORT_KEYS = ("size", "type", "name")
+
+
+def parse_sort(spec: str) -> list[tuple[str, bool]]:
+    """'size:desc,type:asc' -> [('size', True), ('type', False)]; True = descending.
+    Unknown keys/directions fail loudly; duplicate keys keep the first; empty -> default."""
+    out: list[tuple[str, bool]] = []
+    seen = set()
+    for part in filter(None, (p.strip() for p in spec.split(","))):
+        key, _, direction = part.partition(":")
+        direction = direction or "asc"
+        if key not in SORT_KEYS or direction not in ("asc", "desc"):
+            raise ValueError(f"bad sort component {part!r} (keys: size|type|name, dirs: asc|desc)")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((key, direction == "desc"))
+    return out or parse_sort(DEFAULT_SORT)
+
+
+def pick_drives_gui(drives: list[dict], explicit_db: str | None, auto_dir: str,
+                    default_sort: str = DEFAULT_SORT) -> tuple[list[str], str, bool, str]:
+    """Returns (picked_drives, db_path, allow_db_on_scanned, sort_spec_string).
+    Empty drive list = cancelled.
 
     When no --db was given, the catalog field auto-suggests
     census_<letters>_drive_<YYYYMMDDHHMM>.sqlite and keeps updating as drives are
@@ -201,13 +224,33 @@ def pick_drives_gui(drives: list[dict], explicit_db: str | None, auto_dir: str) 
             db_var.set(chosen)  # a browsed choice counts as the user's own value
 
     tk.Button(dest, text="Browse…", command=browse).pack(side="left")
+
+    # summary-table sort: three ordered slots, each a key + direction (— disables a slot)
+    from tkinter import ttk
+    sortf = tk.Frame(root)
+    sortf.pack(fill="x", padx=12, pady=(8, 0))
+    tk.Label(sortf, text="Summary sort:").pack(side="left")
+    seeded = parse_sort(default_sort)
+    slot_vars: list[tuple[tk.StringVar, tk.StringVar]] = []
+    for i in range(3):
+        key = seeded[i][0] if i < len(seeded) else "—"
+        direction = ("desc" if seeded[i][1] else "asc") if i < len(seeded) else "asc"
+        tk.Label(sortf, text=f"  {i + 1}.").pack(side="left")
+        kv = tk.StringVar(value=key)
+        dv = tk.StringVar(value=direction)
+        ttk.Combobox(sortf, textvariable=kv, values=["size", "type", "name", "—"],
+                     width=5, state="readonly").pack(side="left", padx=(2, 0))
+        ttk.Combobox(sortf, textvariable=dv, values=["desc", "asc"],
+                     width=5, state="readonly").pack(side="left", padx=(2, 0))
+        slot_vars.append((kv, dv))
+
     allow_var = tk.BooleanVar(value=False)
     tk.Checkbutton(root, text="Allow the catalog to live on a scanned drive "
                               "(the catalog file itself is excluded from the census)",
                    variable=allow_var, anchor="w", padx=16).pack(fill="x", pady=(2, 0))
 
     picked: list[str] = []
-    result = {"db": "", "allow": False}
+    result = {"db": "", "allow": False, "sort": default_sort}
 
     def go():
         sel = [k for k, v in vars_by_drive.items() if v.get()]
@@ -225,6 +268,8 @@ def pick_drives_gui(drives: list[dict], explicit_db: str | None, auto_dir: str) 
         picked.extend(sel)
         result["db"] = dbp
         result["allow"] = allow_var.get()
+        result["sort"] = ",".join(f"{kv.get()}:{dv.get()}" for kv, dv in slot_vars
+                                  if kv.get() != "—") or DEFAULT_SORT
         root.destroy()
 
     row = tk.Frame(root)
@@ -232,7 +277,7 @@ def pick_drives_gui(drives: list[dict], explicit_db: str | None, auto_dir: str) 
     tk.Button(row, text="Scan", width=12, command=go).pack(side="left", padx=6)
     tk.Button(row, text="Cancel", width=12, command=root.destroy).pack(side="left", padx=6)
     root.mainloop()
-    return picked, result["db"], result["allow"]
+    return picked, result["db"], result["allow"], result["sort"]
 
 
 def iso_now() -> str:
@@ -376,7 +421,7 @@ def _fmt_date(ns: int | None) -> str:
     return datetime.fromtimestamp(ns / 1e9).strftime("%Y-%m-%d")
 
 
-def summarize_scan(con: sqlite3.Connection, scan_id: int, top_n: int) -> dict:
+def summarize_scan(con: sqlite3.Connection, scan_id: int) -> list[dict]:
     """Roll up the scan's tree: per first-level entry, recursive size / file types /
     subfolder counts by level. One in-memory pass; no recursion."""
     rows = con.execute(
@@ -412,12 +457,11 @@ def summarize_scan(con: sqlite3.Connection, scan_id: int, top_n: int) -> dict:
                         item["types"][c["ext"] or "(none)"] += 1
         firsts.append(item)
 
-    total = len(firsts)
-    firsts.sort(key=lambda x: -x["size"])
-    return {"firsts": firsts[:top_n], "omitted": max(0, total - top_n), "total": total}
+    return firsts
 
 
-def write_summary(con: sqlite3.Connection, scan_ids: list[int], txt_path: str, top_n: int):
+def write_summary(con: sqlite3.Connection, scan_ids: list[int], txt_path: str, top_n: int,
+                  sort_spec: list[tuple[str, bool]]):
     out = []
     w = out.append
     w("QUICK CENSUS SUMMARY")
@@ -453,18 +497,15 @@ def write_summary(con: sqlite3.Connection, scan_ids: list[int], txt_path: str, t
             for r in errs:
                 w(f"     {r['path']}  ({r['error']})")
 
-        info = summarize_scan(con, scan_id, top_n)
-        w("")
-        w(f"2. ROOT-LEVEL STRUCTURE ({info['total']} entries at the root"
-          + (f"; showing the {top_n} largest by size, {info['omitted']} omitted" if info["omitted"] else "")
-          + ")")
-        w("")
-        header = (f"   {'name':<36} {'type':<9} {'date':<10} {'size':>10}  "
-                  f"{'major file types':<52} subfolders by level")
-        w(header)
-        w("   " + "-" * (len(header) - 3))
-        for it in info["firsts"]:
-            name = it["name"] if len(it["name"]) <= 36 else it["name"][:33] + "..."
+        firsts = summarize_scan(con, scan_id)
+        total = len(firsts)
+        # the cap always keeps the LARGEST roots (its whole purpose); the sort orders the display
+        firsts.sort(key=lambda x: -x["size"])
+        shown = firsts[:top_n]
+        omitted = total - len(shown)
+
+        rows = []
+        for it in shown:
             if it["reparse"]:
                 typ = "junction" if it["reparse"] == 0xA0000003 else "symlink"
             elif it["is_dir"]:
@@ -481,8 +522,31 @@ def write_summary(con: sqlite3.Connection, scan_ids: list[int], txt_path: str, t
             else:
                 top_types = "-"
                 levels = "-"
-            w(f"   {name:<36} {typ:<9} {_fmt_date(it['mtime_ns']):<10} {human(it['size']):>10}  "
-              f"{top_types:<52} {levels}")
+            rows.append({"name": it["name"], "typ": typ, "date": _fmt_date(it["mtime_ns"]),
+                         "size": it["size"], "types": top_types, "levels": levels})
+        # multi-key sort: chained stable sorts, least-significant key first
+        for key, descending in reversed(sort_spec):
+            if key == "size":
+                rows.sort(key=lambda r: r["size"], reverse=descending)
+            elif key == "type":
+                rows.sort(key=lambda r: r["typ"].casefold(), reverse=descending)
+            else:
+                rows.sort(key=lambda r: r["name"].casefold(), reverse=descending)
+
+        sort_note = ", ".join(f"{k} {'desc' if d else 'asc'}" for k, d in sort_spec)
+        w("")
+        w(f"2. ROOT-LEVEL STRUCTURE ({total} entries at the root"
+          + (f"; showing the {top_n} largest by size, {omitted} omitted" if omitted else "")
+          + f"; sorted by {sort_note})")
+        w("")
+        header = (f"   {'name':<36} {'type':<9} {'date':<10} {'size':>10}  "
+                  f"{'major file types':<52} subfolders by level")
+        w(header)
+        w("   " + "-" * (len(header) - 3))
+        for r in rows:
+            name = r["name"] if len(r["name"]) <= 36 else r["name"][:33] + "..."
+            w(f"   {name:<36} {r['typ']:<9} {r['date']:<10} {human(r['size']):>10}  "
+              f"{r['types']:<52} {r['levels']}")
     w("")
     with open(txt_path, "w", encoding="utf-8-sig") as f:  # BOM: Windows consoles decode it right
         f.write("\n".join(out))
@@ -501,7 +565,13 @@ def main(argv=None) -> int:
                    help="permit the catalog db to live on a drive being scanned")
     p.add_argument("--top", type=int, default=100,
                    help="root-level entries shown in the summary txt, largest first (default 100)")
+    p.add_argument("--sort", default=DEFAULT_SORT,
+                   help="summary-table sort, e.g. size:desc,type:asc,name:asc (keys: size|type|name)")
     args = p.parse_args(argv)
+    try:
+        sort_spec = parse_sort(args.sort)
+    except ValueError as e:
+        p.error(str(e))
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
     infos = detect_drives()
@@ -521,12 +591,13 @@ def main(argv=None) -> int:
                 return 2
             drives.append(d)
     else:
-        drives, gui_db, gui_allow = pick_drives_gui(infos, args.db, script_dir)
+        drives, gui_db, gui_allow, gui_sort = pick_drives_gui(infos, args.db, script_dir, args.sort)
         if not drives:
             print("nothing selected")
             return 0
         args.db = gui_db
         args.allow_db_on_scanned = args.allow_db_on_scanned or gui_allow
+        sort_spec = parse_sort(gui_sort)
 
     if args.db is None:
         args.db = os.path.join(script_dir, suggest_db_name(drives))
@@ -550,7 +621,7 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 130
     else:
-        write_summary(con, scan_ids, txt_path, args.top)
+        write_summary(con, scan_ids, txt_path, args.top, sort_spec)
     finally:
         con.close()
     print(f"catalog: {db_path}")

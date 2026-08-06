@@ -47,6 +47,13 @@ with recursive size, date, its major file types with counts, and subfolder
 counts per level (`lv2:13 lv3:58 …`) so drive depth/width is visible at a
 glance. Roots beyond the `--top` largest (default 100) are omitted with a note.
 
+The table's ordering is configurable: in the popup, three "Summary sort" slots
+(key `size`/`type`/`name` + `asc`/`desc` each; set a slot to `—` to skip it)
+define a multi-key sort, priority left to right; on the command line the same
+spec is `--sort size:desc,type:asc,name:asc` (that string is the default). The
+`--top` cap always keeps the *largest* roots regardless of sort — the sort only
+orders what is shown, and the section header records which sort was used.
+
 Each run adds a new `scan` row per drive — history accumulates in one catalog,
 so two scans of the same drive can be compared later.
 
