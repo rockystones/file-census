@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qc.py — how it works</title>
+<style>
+:root {
+  --bg:#fbfbfc; --fg:#1c2128; --dim:#59636e; --line:#d3d9df; --panel:#f1f4f7;
+  --acc:#0b6bcb; --accent-soft:#e3eefc; --code-bg:#f4f6f8; --warn:#9a6700;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#14161a; --fg:#d7dae0; --dim:#8a919e; --line:#2c313a; --panel:#1d2026;
+          --acc:#5aa7e8; --accent-soft:#16273a; --code-bg:#1a1d22; --warn:#e8b45a; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg);
+       font:15px/1.6 "Segoe UI", system-ui, sans-serif; }
+main { max-width: 900px; margin: 0 auto; padding: 28px 24px 80px; }
+h1 { font-size: 24px; margin: 8px 0 4px; }
+h2 { font-size: 19px; margin: 40px 0 10px; padding-top: 18px; border-top: 1px solid var(--line); }
+h3 { font-size: 15.5px; margin: 22px 0 6px; }
+p, li { max-width: 76ch; }
+.sub { color: var(--dim); margin: 0 0 18px; }
+code, pre { font-family: Consolas, "Cascadia Mono", monospace; font-size: 13.5px; }
+code { background: var(--code-bg); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+pre { background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
+      padding: 14px 16px; overflow-x: auto; line-height: 1.5; }
+pre code { background: none; border: none; padding: 0; }
+table { border-collapse: collapse; width: 100%; margin: 10px 0 18px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--dim); font-weight: 600; }
+td:first-child { white-space: nowrap; font-family: Consolas, monospace; font-size: 13.5px; }
+.note { background: var(--accent-soft); border-left: 3px solid var(--acc);
+        border-radius: 0 8px 8px 0; padding: 10px 14px; margin: 14px 0; }
+figure { margin: 20px 0; }
+figure svg { width: 100%; height: auto; display: block; }
+figcaption { color: var(--dim); font-size: 13px; margin-top: 6px; }
+.svgbox   { fill: var(--panel); stroke: var(--line); stroke-width: 1.2; rx: 8; }
+.svgboxa  { fill: var(--accent-soft); stroke: var(--acc); stroke-width: 1.2; rx: 8; }
+.svgtxt   { fill: var(--fg); font: 13px "Segoe UI", system-ui, sans-serif; }
+.svgtxts  { fill: var(--dim); font: 11.5px "Segoe UI", system-ui, sans-serif; }
+.svgline  { stroke: var(--dim); stroke-width: 1.4; fill: none; }
+.svghead  { fill: var(--dim); }
+.kbd { color: var(--acc); }
+</style>
+</head>
+<body>
+<main>
+
+<h1>qc.py — quick drive census, explained</h1>
+<p class="sub">One Python file (~330 lines, standard library only) that walks entire Windows
+drives and stores every file and folder's metadata in a SQLite database — without ever
+opening a file. This document explains what it calls, what it defines, and how the pieces
+run together.</p>
+
+<!-- ============================================================ -->
+<h2>1 · The libraries doing the heavy lifting</h2>
+
+<table>
+<tr><th>Call</th><th>What it does for qc.py</th></tr>
+<tr><td>os.scandir(dir)</td>
+<td>The workhorse. Lists one directory and yields an entry object per child. On Windows the
+operating system returns each child's metadata <em>as part of the directory listing itself</em>,
+so the follow-up <code>entry.stat(follow_symlinks=False)</code> is free — no extra system call,
+and crucially <strong>no file handle is ever opened</strong>. That is the source of the tool's
+"read-only, can't touch, can't block" guarantee.</td></tr>
+<tr><td>stat fields</td>
+<td>From each entry qc.py reads: <code>st_size</code>, <code>st_mtime_ns</code> (modified) and
+<code>st_birthtime_ns</code> (created) as integer nanoseconds, <code>st_file_attributes</code>
+(the Windows attribute bit-field), and <code>st_reparse_tag</code> (set when the entry is a
+junction or symlink rather than a real file/folder).</td></tr>
+<tr><td>os.listdrives()</td>
+<td>Returns the drive roots currently present (<code>['C:\', 'D:\', …]</code>). Python 3.12+.</td></tr>
+<tr><td>sqlite3</td>
+<td>The whole database engine, embedded, one output file. qc.py uses batch inserts
+(<code>executemany</code>), WAL journal mode (fast, safe), and one recursive SQL view that
+turns the stored parent/child tree back into full paths on demand.</td></tr>
+<tr><td>ctypes → kernel32</td>
+<td>Two tiny Windows API calls not exposed by Python directly:
+<code>GetVolumeInformationW</code> (volume label, filesystem name, serial number) and
+<code>GetDriveTypeW</code> (fixed / removable / remote / cdrom). Both are volume-level
+queries — again, no file opened.</td></tr>
+<tr><td>shutil.disk_usage</td><td>Total and free bytes per drive, recorded with each scan.</td></tr>
+<tr><td>tkinter</td>
+<td>Standard-library GUI. qc.py builds one small dialog from checkboxes
+(<code>Checkbutton</code>), a text field (<code>Entry</code>) for the catalog path,
+a save-file dialog (<code>filedialog.asksaveasfilename</code>), and warning popups
+(<code>messagebox</code>).</td></tr>
+<tr><td>argparse / time / datetime</td>
+<td>Command-line parsing; <code>time.monotonic()</code> for the progress throttle and elapsed
+time; UTC timestamps in ISO form for the scan bookkeeping rows.</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>2 · What qc.py defines, and how values move</h2>
+
+<h3>The functions</h3>
+<table>
+<tr><th>Function</th><th>Purpose and data in/out</th></tr>
+<tr><td>detect_drives()</td>
+<td>Asks Windows for every present drive and packages one dict per drive:
+<code>{drive, type, label, fs, serial, total, free}</code>. This list feeds both
+<code>--list</code> output and the GUI picker rows.</td></tr>
+<tr><td>volume_info(root)</td>
+<td>ctypes wrapper returning <code>(label, fs_type, serial_hex)</code> for one drive root, or
+<code>None</code>s if the query fails (empty CD drive, etc.).</td></tr>
+<tr><td>pick_drives_gui(drives, default_db)</td>
+<td>Builds the dialog and blocks until the user acts. Returns a 3-tuple:
+the ticked drive letters, the catalog file path (typed or browsed, custom name welcome), and
+whether "allow catalog on a scanned drive" was ticked. Cancel returns an empty drive list.
+Validation runs <em>inside</em> the dialog: no drives ticked, or a catalog placed on a
+drive about to be scanned, pops a warning instead of closing.</td></tr>
+<tr><td>open_db(path)</td>
+<td>Opens/creates the SQLite file and applies the schema (all <code>CREATE IF NOT
+EXISTS</code>, so pointing at an existing catalog is a no-op and new scans append).</td></tr>
+<tr><td>scan_drive(con, drive, skip_paths_cf)</td>
+<td>The core. Walks one whole drive and writes rows. Receives the open database connection
+and a small set of paths to skip (the catalog file itself plus its <code>-wal</code>/
+<code>-shm</code> sidecars, so the census never contains its own output). Returns the new
+<code>scan_id</code>. Details in the walkthrough below.</td></tr>
+<tr><td>main(argv)</td>
+<td>Glue: parse arguments → detect drives → choose GUI or CLI path → enforce the
+catalog-location guard → open the database → call <code>scan_drive</code> once per chosen
+drive → print where the catalog landed.</td></tr>
+<tr><td>human(n) / iso_now()</td>
+<td>Cosmetics: byte counts as "10.4 GiB"; UTC timestamps as ISO strings.</td></tr>
+</table>
+
+<h3>The variables that carry the state</h3>
+<table>
+<tr><th>Variable</th><th>Role</th></tr>
+<tr><td>infos → drives</td>
+<td><code>infos</code> is the detected-drive list; <code>drives</code> is the user's chosen
+subset, normalized to <code>"X:"</code> form. Everything downstream loops over
+<code>drives</code>.</td></tr>
+<tr><td>args.db → db_path → skip</td>
+<td>The catalog location: default is <code>census.sqlite</code> beside the script, overridden
+by <code>--db</code> or by the GUI field. After the guard passes, the absolute path plus its
+two sidecar names becomes the <code>skip</code> set handed to every scan.</td></tr>
+<tr><td>scan_id</td>
+<td>Primary key of the bookkeeping row created at scan start (status
+<code>running</code>) and finalized at the end (counts + status <code>done</code> /
+<code>aborted</code>). Every entry row carries it, which is how multiple scans — even of the
+same drive — coexist in one catalog.</td></tr>
+<tr><td>next_id / parent_id</td>
+<td>Entry ids are assigned <em>by the Python code</em>, not by the database. Reason: a child
+row must store its parent folder's id, so the parent's id must be known <em>before</em> the
+database insert happens. Pre-assigning ids from a counter lets qc.py insert everything in
+large batches. The (parent_id → entry_id) chain <em>is</em> the folder tree.</td></tr>
+<tr><td>stack</td>
+<td>The to-do list of the walk: tuples of <code>(directory path, its entry id, depth)</code>.
+Starting with the drive root, each directory found is pushed; the loop runs until the stack
+is empty. An explicit stack (instead of recursion) means a million-deep tree can't overflow
+anything.</td></tr>
+<tr><td>batch / err_batch</td>
+<td>Pending rows, flushed to SQLite every 5,000 via <code>executemany</code> + commit.
+Batching is why half a million rows insert in seconds.</td></tr>
+<tr><td>n_files, n_dirs, n_bytes, n_errs</td>
+<td>Running counters shown in the progress line and written into the final scan row —
+so summary numbers are recorded facts, not re-derived.</td></tr>
+</table>
+
+<figure>
+<svg viewBox="0 0 880 240" role="img" aria-label="End-to-end pipeline flow diagram">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" class="svghead"/></marker></defs>
+  <rect x="10"  y="20" width="120" height="44" class="svgbox"/>
+  <text x="70" y="39" text-anchor="middle" class="svgtxt">start qc.py</text>
+  <text x="70" y="55" text-anchor="middle" class="svgtxts">(with/without args)</text>
+  <path d="M130 42 L172 42" class="svgline" marker-end="url(#ah)"/>
+  <rect x="174" y="8" width="150" height="34" class="svgbox"/>
+  <text x="249" y="30" text-anchor="middle" class="svgtxt">drive letters given?</text>
+  <path d="M249 42 L249 66" class="svgline" marker-end="url(#ah)"/>
+  <text x="258" y="60" class="svgtxts">no</text>
+  <rect x="160" y="68" width="178" height="58" class="svgboxa"/>
+  <text x="249" y="90" text-anchor="middle" class="svgtxt">GUI picker</text>
+  <text x="249" y="106" text-anchor="middle" class="svgtxts">drives + catalog path/name</text>
+  <text x="249" y="119" text-anchor="middle" class="svgtxts">+ allow-on-scanned tick</text>
+  <path d="M324 25 L420 25 L420 60" class="svgline" marker-end="url(#ah)"/>
+  <text x="360" y="20" class="svgtxts">yes</text>
+  <rect x="352" y="62" width="136" height="40" class="svgbox"/>
+  <text x="420" y="80" text-anchor="middle" class="svgtxt">normalize + verify</text>
+  <text x="420" y="95" text-anchor="middle" class="svgtxts">letters exist</text>
+  <path d="M338 97 L352 97" class="svgline" marker-end="url(#ah)"/>
+  <path d="M488 82 L540 82" class="svgline" marker-end="url(#ah)"/>
+  <rect x="542" y="56" width="160" height="52" class="svgbox"/>
+  <text x="622" y="76" text-anchor="middle" class="svgtxt">guard: catalog on a</text>
+  <text x="622" y="91" text-anchor="middle" class="svgtxt">scanned drive?</text>
+  <path d="M622 108 L622 134" class="svgline" marker-end="url(#ah)"/>
+  <text x="630" y="128" class="svgtxts">refuse unless allowed</text>
+  <rect x="542" y="136" width="160" height="38" class="svgbox"/>
+  <text x="622" y="159" text-anchor="middle" class="svgtxt">open_db → schema</text>
+  <path d="M622 174 L622 196" class="svgline" marker-end="url(#ah)"/>
+  <rect x="500" y="198" width="244" height="38" class="svgboxa"/>
+  <text x="622" y="216" text-anchor="middle" class="svgtxt">for each drive: scan_drive(con, drive)</text>
+  <text x="622" y="230" text-anchor="middle" class="svgtxts">sequential; Ctrl-C marks current scan 'aborted'</text>
+  <path d="M744 217 L800 217" class="svgline" marker-end="url(#ah)"/>
+  <rect x="802" y="198" width="70" height="38" class="svgbox"/>
+  <text x="837" y="216" text-anchor="middle" class="svgtxt">summary</text>
+  <text x="837" y="230" text-anchor="middle" class="svgtxts">per drive</text>
+</svg>
+<figcaption>Figure 1 — the pipeline: both entry paths (GUI / CLI) converge on the same
+guard → database → per-drive scan sequence.</figcaption>
+</figure>
+
+<figure>
+<svg viewBox="0 0 880 300" role="img" aria-label="scan_drive inner loop diagram">
+  <defs><marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" class="svghead"/></marker></defs>
+  <rect x="10" y="16" width="180" height="40" class="svgbox"/>
+  <text x="100" y="34" text-anchor="middle" class="svgtxt">insert scan row ('running')</text>
+  <text x="100" y="49" text-anchor="middle" class="svgtxts">label, fs, serial, disk totals</text>
+  <path d="M190 36 L232 36" class="svgline" marker-end="url(#ah2)"/>
+  <rect x="234" y="16" width="190" height="40" class="svgbox"/>
+  <text x="329" y="34" text-anchor="middle" class="svgtxt">seed: root row + stack</text>
+  <text x="329" y="49" text-anchor="middle" class="svgtxts">[(\\?\X:\, root_id, depth 1)]</text>
+  <path d="M424 36 L466 36" class="svgline" marker-end="url(#ah2)"/>
+  <rect x="468" y="16" width="150" height="40" class="svgboxa"/>
+  <text x="543" y="34" text-anchor="middle" class="svgtxt">pop a directory</text>
+  <text x="543" y="49" text-anchor="middle" class="svgtxts">loop until stack empty</text>
+  <path d="M618 36 L668 36" class="svgline" marker-end="url(#ah2)"/>
+  <rect x="670" y="16" width="200" height="40" class="svgbox"/>
+  <text x="770" y="34" text-anchor="middle" class="svgtxt">scandir → children + metadata</text>
+  <text x="770" y="49" text-anchor="middle" class="svgtxts">denied? → scan_error row, continue</text>
+  <path d="M770 56 L770 92" class="svgline" marker-end="url(#ah2)"/>
+  <rect x="600" y="94" width="270" height="34" class="svgbox"/>
+  <text x="735" y="115" text-anchor="middle" class="svgtxt">for each child: assign id = next_id++</text>
+  <path d="M735 128 L735 152" class="svgline" marker-end="url(#ah2)"/>
+  <rect x="336" y="154" width="176" height="56" class="svgbox"/>
+  <text x="424" y="172" text-anchor="middle" class="svgtxt">file →</text>
+  <text x="424" y="188" text-anchor="middle" class="svgtxts">row: name, size, times, attr,</text>
+  <text x="424" y="201" text-anchor="middle" class="svgtxts">ext, depth, parent_id</text>
+  <rect x="524" y="154" width="170" height="56" class="svgbox"/>
+  <text x="609" y="172" text-anchor="middle" class="svgtxt">folder →</text>
+  <text x="609" y="188" text-anchor="middle" class="svgtxts">row + push (path, id, depth+1)</text>
+  <text x="609" y="201" text-anchor="middle" class="svgtxts">so its children nest under it</text>
+  <rect x="706" y="154" width="164" height="56" class="svgbox"/>
+  <text x="788" y="172" text-anchor="middle" class="svgtxt">junction/symlink →</text>
+  <text x="788" y="188" text-anchor="middle" class="svgtxts">row with reparse_tag,</text>
+  <text x="788" y="201" text-anchor="middle" class="svgtxts">NEVER pushed (cycle-safe)</text>
+  <path d="M424 210 L424 240 L560 240" class="svgline"/>
+  <path d="M609 210 L609 240" class="svgline"/>
+  <path d="M788 210 L788 240 L660 240" class="svgline"/>
+  <path d="M609 240 L609 252" class="svgline" marker-end="url(#ah2)"/>
+  <rect x="480" y="254" width="260" height="38" class="svgboxa"/>
+  <text x="610" y="272" text-anchor="middle" class="svgtxt">batch ≥ 5000? → executemany + commit</text>
+  <text x="610" y="286" text-anchor="middle" class="svgtxts">then keep looping; finalize scan row at the end</text>
+  <path d="M480 273 L100 273 L100 60" class="svgline" marker-end="url(#ah2)"/>
+  <text x="112" y="80" class="svgtxts">finalize: counts,</text>
+  <text x="112" y="94" class="svgtxts">status, top-10 ext</text>
+</svg>
+<figcaption>Figure 2 — inside <code>scan_drive</code>: an explicit-stack depth-first walk;
+every child becomes one batched row; only real folders are pushed for descent.</figcaption>
+</figure>
+
+<h3>The four things stored</h3>
+<table>
+<tr><th>Table / view</th><th>Contents</th></tr>
+<tr><td>scan</td><td>One row per drive per run: label, filesystem, serial, disk totals,
+start/finish times, final counts, status. The catalog accumulates history — re-scans of the
+same drive are new rows, enabling later comparison.</td></tr>
+<tr><td>entry</td><td>One row per file or folder: <code>parent_id</code> (the tree),
+<code>name</code>, <code>is_dir</code>, <code>size_bytes</code>, modified/created times
+(integer nanoseconds), attribute bits, reparse tag, extension, depth. Full paths are
+deliberately <em>not</em> stored — storing each name once against a parent pointer kept a
+642,000-row catalog at 73 MiB.</td></tr>
+<tr><td>scan_error</td><td>Directories/files that could not be listed (typically
+access-denied system folders), with the error text. The walk records and continues.</td></tr>
+<tr><td>v_paths (view)</td><td>A recursive SQL query that rebuilds
+<code>X:\full\path</code> strings from the tree when you ask for them — so the convenience
+of flat paths exists at query time without paying its storage cost. Always filter it by
+<code>scan_id</code>.</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>3 · Pseudo-code: the whole program on one screen</h2>
+
+<pre><code>main:
+    drive_infos = detect_drives()                     # letter, type, label, sizes
+    if --list:  print drive_infos; exit
+
+    if drive letters were passed on the command line:
+        drives = normalize and verify them            # "e" / "E:\" → "E:"
+    else:
+        drives, db_path, allow = GUI dialog           # checkboxes + catalog field
+        if user cancelled: exit
+
+    if db_path sits on any drive in drives and not allow:
+        refuse and exit                               # the read-only promise
+
+    con  = open_db(db_path)                           # creates tables/view if new
+    skip = { db_path, db_path-wal, db_path-shm }      # never census our own output
+    for drive in drives:
+        scan_drive(con, drive, skip)
+
+
+scan_drive(con, drive, skip):
+    scan_id  = insert scan row (status='running', label, fs, disk totals)
+    next_id  = highest existing entry id + 1          # ids assigned in Python
+    insert root row (name=drive, parent=NULL, depth 0)
+    stack = [ (\\?\drive\, root_id, depth 1) ]        # \\?\ prefix = long-path safe
+
+    while stack not empty:
+        folder, parent_id, depth = stack.pop()
+        children = scandir(folder)                    # may fail → scan_error, continue
+        for child in children:
+            meta = child.stat(follow_symlinks=False)  # free: comes with the listing
+            id   = next_id;  next_id += 1
+            if child is a folder:
+                append row (id, parent_id, name, times, attr, depth)
+                if not junction/symlink:              # reparse points recorded,
+                    stack.push(child, id, depth+1)    #   never entered → no cycles
+            else if child not in skip:
+                append row (id, parent_id, name, size, times, attr, ext, depth)
+            if 5000 rows pending: write them, commit  # executemany batch
+
+        update progress line (throttled to 4/sec)
+
+    write remaining rows
+    finalize scan row: file/dir/byte/error counts, status 'done'
+    print summary + top-10 extensions by bytes        # read back from SQLite
+</code></pre>
+
+<div class="note">
+<strong>Why it's fast and safe, in one breath:</strong> the directory listing already
+contains every fact qc.py wants, so the tool is one long sequence of "list folder, remember
+children, push subfolders" — no file opens (nothing can be locked, modified, or triggered),
+no recursion (no depth limits), ids pre-assigned (everything batches), junctions never
+entered (no infinite loops), failures logged instead of fatal. 550,000 files → 68 seconds
+→ one 73 MiB SQLite file you can query with plain SQL.</div>
+
+<p class="sub">Companion file: README.md (usage, guarantees, ready-made SQL queries).
+Generated 2026-07-30 for qc.py v1.1.</p>
+
+</main>
+</body>
+</html>
