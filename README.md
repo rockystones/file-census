@@ -1,6 +1,8 @@
 # quickcensus — read-only whole-drive metadata census
 
-One file, standard library only, Windows, Python 3.12+. Walks entire drives and
+One file, standard library only, Windows, Python 3.11+ (Anaconda base works;
+on 3.12+ drive discovery uses `os.listdrives`, older versions fall back to a
+Win32 call). Walks entire drives and
 records what directory enumeration alone provides — **no file is ever opened**:
 
 - names + full folder structure (parent/child tree)
