@@ -79,10 +79,14 @@ only — on older interpreters (3.11 Anaconda etc.) qc.py falls back to the Win3
 (<code>executemany</code>), WAL journal mode (fast, safe), and one recursive SQL view that
 turns the stored parent/child tree back into full paths on demand.</td></tr>
 <tr><td>ctypes → kernel32</td>
-<td>Two tiny Windows API calls not exposed by Python directly:
-<code>GetVolumeInformationW</code> (volume label, filesystem name, serial number) and
-<code>GetDriveTypeW</code> (fixed / removable / remote / cdrom). Both are volume-level
-queries — again, no file opened.</td></tr>
+<td>Windows API calls not exposed by Python directly: <code>GetVolumeInformationW</code>
+(label, filesystem, volume serial), <code>GetDriveTypeW</code> (fixed/removable/remote/cdrom),
+<code>GetLogicalDrives</code> (pre-3.12 drive discovery),
+<code>GetVolumeNameForVolumeMountPointW</code> (volume GUID), and
+<code>DeviceIoControl(IOCTL_STORAGE_QUERY_PROPERTY)</code> on a <strong>zero-access</strong>
+volume-device handle — the zero access request is what makes the physical-device
+product/serial readable without elevation, and it also means that handle can neither read
+nor write any data. Still no file is ever opened.</td></tr>
 <tr><td>shutil.disk_usage</td><td>Total and free bytes per drive, recorded with each scan.</td></tr>
 <tr><td>tkinter</td>
 <td>Standard-library GUI. qc.py builds one small dialog from checkboxes
@@ -107,6 +111,17 @@ time; UTC timestamps in ISO form for the scan bookkeeping rows.</td></tr>
 <tr><td>volume_info(root)</td>
 <td>ctypes wrapper returning <code>(label, fs_type, serial_hex)</code> for one drive root, or
 <code>None</code>s if the query fails (empty CD drive, etc.).</td></tr>
+<tr><td>volume_guid_of / hardware_identity_of</td>
+<td>The other two identity tiers stored on every scan row and printed in the summary txt:
+the per-machine-stable Volume GUID, and the physical device's product + serial (survives
+reformatting). Together with the volume serial they let later processing match scans of the
+same drive even when its letter changed — the letter is presentation, not identity.</td></tr>
+<tr><td>is_cloud_tag(tag)</td>
+<td>Recognizes the OneDrive/cloud placeholder reparse-tag family (0x9000001A + provider
+variants). Junctions and symlinks are never descended; cloud placeholder <em>folders</em>
+are descended only when the user opts in (<code>--include-cloud</code> / GUI checkbox,
+default off) — enumeration is metadata-only and can never download file content, though it
+may make the sync client materialize child placeholder stubs.</td></tr>
 <tr><td>pick_drives_gui(drives, explicit_db, auto_dir)</td>
 <td>Builds the dialog and blocks until the user acts. Returns a 3-tuple:
 the ticked drive letters, the catalog file path, and whether "allow catalog on a scanned
@@ -331,8 +346,9 @@ scan_drive(con, drive, skip):
             id   = next_id;  next_id += 1
             if child is a folder:
                 append row (id, parent_id, name, times, attr, depth)
-                if not junction/symlink:              # reparse points recorded,
-                    stack.push(child, id, depth+1)    #   never entered → no cycles
+                if not reparse point                  # junctions/symlinks: never entered
+                   or (opted-in and cloud placeholder tag):   # OneDrive online-only dirs
+                    stack.push(child, id, depth+1)    #   metadata-only; no cycles
             else if child not in skip:
                 append row (id, parent_id, name, size, times, attr, ext, depth)
             if 5000 rows pending: write them, commit  # executemany batch
@@ -347,10 +363,19 @@ scan_drive(con, drive, skip):
 <div class="note">
 <strong>Why it's fast and safe, in one breath:</strong> the directory listing already
 contains every fact qc.py wants, so the tool is one long sequence of "list folder, remember
-children, push subfolders" — no file opens (nothing can be locked, modified, or triggered),
-no recursion (no depth limits), ids pre-assigned (everything batches), junctions never
-entered (no infinite loops), failures logged instead of fatal. 550,000 files → 68 seconds
-→ one 73 MiB SQLite file you can query with plain SQL.</div>
+children, push subfolders" — no file opens (nothing can be locked, modified, triggered, or
+cloud-hydrated), no recursion (no depth limits), ids pre-assigned (everything batches),
+junctions never entered (no infinite loops), failures logged instead of fatal.
+550,000 files → 68 seconds → one 73 MiB SQLite file you can query with plain SQL.</div>
+
+<div class="note">
+<strong>Privacy model:</strong> the catalog itself lists every filename on a drive — treat
+it as sensitive. The tool never transmits anything (no network code exists); after that,
+protection is exactly the NTFS permissions of wherever the catalog sits. Two honest limits:
+other administrators of the machine can read any file, and a catalog written inside a
+cloud-synced folder will sync like anything else — which is why the GUI suggests a private
+location (e.g. <code>%LOCALAPPDATA%\quickcensus</code>) when the cloud opt-in is ticked.
+Full reasoning in README.md.</div>
 
 <p class="sub">Companion file: README.md (usage, guarantees, ready-made SQL queries).
 Generated 2026-07-30 for qc.py v1.1.</p>

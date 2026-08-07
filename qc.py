@@ -41,8 +41,11 @@ CREATE TABLE IF NOT EXISTS scan(
   scan_id      INTEGER PRIMARY KEY,
   drive        TEXT NOT NULL,
   label        TEXT,
-  fs_type      TEXT,
-  serial_hex   TEXT,
+  fs_type     TEXT,
+  serial_hex   TEXT,               -- volume serial: format-time, travels with the drive
+  volume_guid  TEXT,               -- Volume GUID path: per-machine stable across letter changes
+  hw_product   TEXT,               -- physical device model (zero-access IOCTL)
+  hw_serial    TEXT,               -- physical device serial: survives reformat
   disk_total   INTEGER,
   disk_free    INTEGER,
   started_utc  TEXT NOT NULL,
@@ -96,6 +99,65 @@ _k32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
 _k32.GetDriveTypeW.restype = wintypes.UINT
 _k32.GetLogicalDrives.argtypes = []
 _k32.GetLogicalDrives.restype = wintypes.DWORD
+_k32.GetVolumeNameForVolumeMountPointW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+_k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                             wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+_k32.CreateFileW.restype = wintypes.HANDLE
+_k32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                                 wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                                 wintypes.LPVOID]
+_k32.CloseHandle.argtypes = [wintypes.HANDLE]
+_INVALID_HANDLE = wintypes.HANDLE(-1).value
+_IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
+
+# OneDrive/cloud placeholder reparse tags: 0x9000001A plus per-provider variants that
+# differ only in one nibble — mask it out to match the whole family.
+def is_cloud_tag(tag: int | None) -> bool:
+    return tag is not None and (tag & 0xFFFF0FFF) == 0x9000001A
+
+
+def volume_guid_of(root: str) -> str | None:
+    """\\\\?\\Volume{...}\\ for a root like 'E:\\'. Unelevated; stable per machine
+    across drive-letter changes (but assigned per Windows install)."""
+    buf = ctypes.create_unicode_buffer(64)
+    if _k32.GetVolumeNameForVolumeMountPointW(root, buf, len(buf)):
+        return buf.value or None
+    return None
+
+
+def hardware_identity_of(drive: str) -> tuple[str | None, str | None]:
+    """(product, serial) of the physical device behind a drive, via
+    IOCTL_STORAGE_QUERY_PROPERTY on a ZERO-ACCESS volume handle — the zero access
+    request is what makes this work without elevation. Survives reformatting; USB
+    bridges sometimes report the enclosure or nothing."""
+    h = _k32.CreateFileW("\\\\.\\" + drive, 0, 0x3, None, 3, 0, None)  # access 0, share RW, OPEN_EXISTING
+    if h == _INVALID_HANDLE:
+        return None, None
+    try:
+        query = (ctypes.c_ubyte * 12)()  # STORAGE_PROPERTY_QUERY: StorageDeviceProperty, PropertyStandardQuery
+        out = (ctypes.c_ubyte * 1024)()
+        returned = wintypes.DWORD()
+        ok = _k32.DeviceIoControl(h, _IOCTL_STORAGE_QUERY_PROPERTY, query, len(query),
+                                  out, len(out), ctypes.byref(returned), None)
+        if not ok or returned.value < 36:
+            return None, None
+        buf = bytes(out[:returned.value])
+
+        def read_str(off_pos: int) -> str | None:
+            off = int.from_bytes(buf[off_pos:off_pos + 4], "little")
+            if not 0 < off < len(buf):
+                return None
+            end = buf.find(b"\0", off)
+            s = buf[off:end if end != -1 else len(buf)].decode("ascii", "replace").strip()
+            return s or None
+
+        vendor = read_str(12)
+        product = read_str(16)
+        serial = read_str(24)
+        full_product = " ".join(p for p in (vendor, product) if p) or None
+        return full_product, serial
+    finally:
+        _k32.CloseHandle(h)
 DRIVE_TYPE_NAMES = {0: "unknown", 1: "invalid", 2: "removable", 3: "fixed",
                     4: "remote", 5: "cdrom", 6: "ramdisk"}
 
@@ -195,14 +257,16 @@ def pick_drives_gui(drives: list[dict], explicit_db: str | None, auto_dir: str,
 
     db_var = tk.StringVar()
     last_auto = [""]  # sentinel: field still tracks our suggestions while it equals this
+    auto_dir_ref = [auto_dir]  # cloud opt-in may retarget suggestions to a private dir
+
+    def tracking() -> bool:
+        return explicit_db is None and db_var.get().strip() in ("", last_auto[0])
 
     def refresh_suggestion(*_):
-        if explicit_db is not None:
+        if not tracking():
             return
-        if db_var.get().strip() not in ("", last_auto[0]):
-            return  # user typed a custom value: stop suggesting
         sel = [k for k, v in vars_by_drive.items() if v.get()]
-        suggestion = os.path.join(auto_dir, suggest_db_name(sel))
+        suggestion = os.path.join(auto_dir_ref[0], suggest_db_name(sel))
         last_auto[0] = suggestion
         db_var.set(suggestion)
 
@@ -225,7 +289,7 @@ def pick_drives_gui(drives: list[dict], explicit_db: str | None, auto_dir: str,
     tk.Entry(dest, textvariable=db_var, width=64).pack(side="left", fill="x", expand=True, padx=6)
 
     def browse():
-        cur = db_var.get().strip() or os.path.join(auto_dir, suggest_db_name([]))
+        cur = db_var.get().strip() or os.path.join(auto_dir_ref[0], suggest_db_name([]))
         chosen = filedialog.asksaveasfilename(
             parent=root, title="Save catalog as",
             initialdir=os.path.dirname(os.path.abspath(cur)) or ".",
@@ -262,15 +326,42 @@ def pick_drives_gui(drives: list[dict], explicit_db: str | None, auto_dir: str,
                               "(the catalog file itself is excluded from the census)",
                    variable=allow_var, anchor="w", padx=16).pack(fill="x", pady=(2, 0))
 
+    cloud_var = tk.BooleanVar(value=False)
+    cloud_hint = tk.Label(root, text="", anchor="w", padx=32, fg="#9a6700")
+
+    def cloud_toggled():
+        if cloud_var.get():
+            cloud_hint.config(
+                text="tip: catalogs listing cloud folders are sensitive too — a private location like "
+                     "%LOCALAPPDATA%\\quickcensus keeps the catalog itself out of sync roots.")
+            new_dir = os.path.join(os.environ.get("LOCALAPPDATA", auto_dir), "quickcensus")
+        else:
+            cloud_hint.config(text="")
+            new_dir = auto_dir
+        if tracking():  # only steer the suggestion while the user hasn't taken over
+            auto_dir_ref[0] = new_dir
+            sel = [k for k, v in vars_by_drive.items() if v.get()]
+            suggestion = os.path.join(new_dir, suggest_db_name(sel))
+            last_auto[0] = suggestion
+            db_var.set(suggestion)
+        else:
+            auto_dir_ref[0] = new_dir
+
+    tk.Checkbutton(root, text="List cloud placeholder subtrees (OneDrive online-only folders) — "
+                              "metadata-only, never downloads file content",
+                   variable=cloud_var, anchor="w", padx=16,
+                   command=cloud_toggled).pack(fill="x", pady=(2, 0))
+    cloud_hint.pack(fill="x")
+
     picked: list[str] = []
-    result = {"db": "", "allow": False, "sort": default_sort}
+    result = {"db": "", "allow": False, "sort": default_sort, "cloud": False}
 
     def go():
         sel = [k for k, v in vars_by_drive.items() if v.get()]
         if not sel:
             messagebox.showwarning("quick census", "No drives selected.", parent=root)
             return
-        dbp = os.path.abspath(db_var.get().strip() or os.path.join(auto_dir, suggest_db_name(sel)))
+        dbp = os.path.abspath(db_var.get().strip() or os.path.join(auto_dir_ref[0], suggest_db_name(sel)))
         if os.path.splitdrive(dbp)[0].upper() in {d.upper() for d in sel} and not allow_var.get():
             messagebox.showwarning(
                 "quick census",
@@ -281,6 +372,7 @@ def pick_drives_gui(drives: list[dict], explicit_db: str | None, auto_dir: str,
         picked.extend(sel)
         result["db"] = dbp
         result["allow"] = allow_var.get()
+        result["cloud"] = cloud_var.get()
         result["sort"] = ",".join(f"{kv.get()}:{dv.get()}" for kv, dv in slot_vars
                                   if kv.get() != "—") or DEFAULT_SORT
         root.destroy()
@@ -290,7 +382,7 @@ def pick_drives_gui(drives: list[dict], explicit_db: str | None, auto_dir: str,
     tk.Button(row, text="Scan", width=12, command=go).pack(side="left", padx=6)
     tk.Button(row, text="Cancel", width=12, command=root.destroy).pack(side="left", padx=6)
     root.mainloop()
-    return picked, result["db"], result["allow"], result["sort"]
+    return picked, result["db"], result["allow"], result["sort"], result["cloud"]
 
 
 def iso_now() -> str:
@@ -308,22 +400,30 @@ def open_db(path: str) -> sqlite3.Connection:
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
+    # migrate catalogs created before the identity columns existed
+    cols = {r[1] for r in con.execute("PRAGMA table_info(scan)")}
+    for col in ("volume_guid", "hw_product", "hw_serial"):
+        if col not in cols:
+            con.execute(f"ALTER TABLE scan ADD COLUMN {col} TEXT")
     con.execute("PRAGMA synchronous = NORMAL")
     return con
 
 
-def scan_drive(con: sqlite3.Connection, drive: str, skip_paths_cf: set[str]) -> int:
+def scan_drive(con: sqlite3.Connection, drive: str, skip_paths_cf: set[str],
+               include_cloud: bool = False) -> int:
     root = drive + "\\"
     label, fs, serial = volume_info(root)
+    guid = volume_guid_of(root)
+    hw_product, hw_serial = hardware_identity_of(drive)
     try:
         usage = shutil.disk_usage(root)
         disk_total, disk_free = usage.total, usage.free
     except OSError:
         disk_total = disk_free = None
     cur = con.execute(
-        "INSERT INTO scan(drive, label, fs_type, serial_hex, disk_total, disk_free, started_utc) "
-        "VALUES(?,?,?,?,?,?,?)",
-        (drive, label, fs, serial, disk_total, disk_free, iso_now()))
+        "INSERT INTO scan(drive, label, fs_type, serial_hex, volume_guid, hw_product, hw_serial, "
+        "disk_total, disk_free, started_utc) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (drive, label, fs, serial, guid, hw_product, hw_serial, disk_total, disk_free, iso_now()))
     scan_id = cur.lastrowid
     con.commit()
 
@@ -393,7 +493,12 @@ def scan_drive(con: sqlite3.Connection, drive: str, skip_paths_cf: set[str]) -> 
                         batch.append((eid, scan_id, parent_id, entry.name, 1, None,
                                       st.st_mtime_ns, birth, attr, tag, None, depth))
                         n_dirs += 1
-                        if not is_reparse:  # junction/symlink dirs recorded, never descended
+                        # junctions/symlinks are never descended (cycle guard). Cloud
+                        # placeholder dirs (OneDrive online-only) are descended only on
+                        # explicit opt-in: enumeration is metadata-only and hydrates no
+                        # content, but it may cause the sync client to materialize child
+                        # placeholder stubs (a metadata network event).
+                        if not is_reparse or (include_cloud and is_cloud_tag(tag)):
                             stack.append((entry.path, eid, depth + 1))
                     else:
                         if entry.path[4:].casefold() in skip_paths_cf:
@@ -497,6 +602,10 @@ def write_summary(con: sqlite3.Connection, scan_ids: list[int], txt_path: str, t
           f" cataloged, {s['error_count']} unreadable path(s){elapsed}, status {s['status']}")
         w(f"   disk: {human(s['disk_total'])} total, {human(s['disk_free'])} free"
           f"   scanned {s['started_utc']}")
+        hw = " ".join(p for p in (s["hw_product"], s["hw_serial"] and f"SN {s['hw_serial']}") if p)
+        w(f"   identity: volume serial {s['serial_hex'] or '—'} (travels with the drive)"
+          f" · volume GUID {s['volume_guid'] or '—'} (this machine)"
+          f" · hardware {hw or '—'} (survives reformat)")
         w("")
         w(f"   {'type':<10} {'files':>9}  {'bytes':>10}")
         for r in con.execute(
@@ -594,6 +703,9 @@ def main(argv=None) -> int:
                    help="root-level entries shown in the summary txt, largest first (default 100)")
     p.add_argument("--sort", default=DEFAULT_SORT,
                    help="summary-table sort, e.g. size:desc,type:asc,name:asc (keys: size|type|name)")
+    p.add_argument("--include-cloud", action="store_true",
+                   help="descend into cloud placeholder dirs (OneDrive online-only): metadata-only, "
+                        "never downloads content; may make the sync client materialize child stubs")
     args = p.parse_args(argv)
     try:
         sort_spec = parse_sort(args.sort)
@@ -618,13 +730,19 @@ def main(argv=None) -> int:
                 return 2
             drives.append(d)
     else:
-        drives, gui_db, gui_allow, gui_sort = pick_drives_gui(infos, args.db, script_dir, args.sort)
+        drives, gui_db, gui_allow, gui_sort, gui_cloud = pick_drives_gui(
+            infos, args.db, script_dir, args.sort)
         if not drives:
             print("nothing selected")
             return 0
         args.db = gui_db
         args.allow_db_on_scanned = args.allow_db_on_scanned or gui_allow
+        args.include_cloud = args.include_cloud or gui_cloud
         sort_spec = parse_sort(gui_sort)
+
+    if args.include_cloud and args.db is None:
+        print("tip: --include-cloud catalogs are sensitive too — consider "
+              "--db %LOCALAPPDATA%\\quickcensus\\... to keep them out of sync roots", file=sys.stderr)
 
     if args.db is None:
         args.db = os.path.join(script_dir, suggest_db_name(drives))
@@ -642,7 +760,7 @@ def main(argv=None) -> int:
     scan_ids: list[int] = []
     try:
         for d in drives:
-            scan_ids.append(scan_drive(con, d, skip))
+            scan_ids.append(scan_drive(con, d, skip, include_cloud=args.include_cloud))
     except KeyboardInterrupt:
         print("\naborted by user — completed drives are intact, current scan marked 'aborted'",
               file=sys.stderr)
