@@ -565,9 +565,23 @@ def write_summary(con: sqlite3.Connection, scan_ids: list[int], txt_path: str, t
         f.write("\n".join(out))
 
 
+MIN_PYTHON = (3, 11)  # deliberately chosen floor (current Anaconda base); tested there and on 3.14
+
+
+def require_supported_python(tool: str) -> bool:
+    if sys.version_info < MIN_PYTHON:
+        have = ".".join(map(str, sys.version_info[:3]))
+        print(f"{tool} needs Python {'.'.join(map(str, MIN_PYTHON))}+ — you are running {have}.\n"
+              f"Install a newer Python (or conda env) and rerun.", file=sys.stderr)
+        return False
+    return True
+
+
 def main(argv=None) -> int:
     if os.name != "nt":
         print("qc.py is Windows-only", file=sys.stderr)
+        return 2
+    if not require_supported_python("qc.py"):
         return 2
     p = argparse.ArgumentParser(description="quick read-only metadata census into SQLite")
     p.add_argument("drives", nargs="*", help="drive letters like C: E: (omit for a GUI picker)")
