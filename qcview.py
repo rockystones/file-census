@@ -518,6 +518,9 @@ def main() -> int:
     if os.name != "nt":
         print("qcview.py is Windows-only (matches qc.py catalogs)", file=sys.stderr)
         return 2
+    from qc import require_supported_python
+    if not require_supported_python("qcview.py"):
+        return 2
     db = sys.argv[1] if len(sys.argv) > 1 else None
     if db and not os.path.exists(db):
         print(f"not found: {db}", file=sys.stderr)
