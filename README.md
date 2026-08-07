@@ -74,6 +74,14 @@ identical across the whole family stay literal, only the varying ones become
 `#`. The "Collapse similar names ≥ N" toggle and threshold control it
 (default ≥ 5).
 
+When a catalog holds two or more scans, the **Diff…** button compares any pair
+A→B (defaults to the two most recent): a change-only tree shows added (green),
+removed (red), and size/mtime-changed (orange) files, with every ancestor
+folder badged with its rollup (`+12 −3 ~5`, net bytes). Comparison is keyed on
+paths relative to the drive root, so re-lettered drives still compare;
+directory-mtime drift is deliberately ignored as noise. Status checkboxes
+filter the view; small diffs open fully expanded.
+
 ## Catalog schema (SQLite)
 
 - `scan` — one row per drive per run: label, fs, serial, disk totals, timings,
