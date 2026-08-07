@@ -71,7 +71,9 @@ and crucially <strong>no file handle is ever opened</strong>. That is the source
 (the Windows attribute bit-field), and <code>st_reparse_tag</code> (set when the entry is a
 junction or symlink rather than a real file/folder).</td></tr>
 <tr><td>os.listdrives()</td>
-<td>Returns the drive roots currently present (<code>['C:\', 'D:\', …]</code>). Python 3.12+.</td></tr>
+<td>Returns the drive roots currently present (<code>['C:\', 'D:\', …]</code>). Python 3.12+
+only — on older interpreters (3.11 Anaconda etc.) qc.py falls back to the Win32
+<code>GetLogicalDrives</code> bitmask, one bit per existing drive letter.</td></tr>
 <tr><td>sqlite3</td>
 <td>The whole database engine, embedded, one output file. qc.py uses batch inserts
 (<code>executemany</code>), WAL journal mode (fast, safe), and one recursive SQL view that

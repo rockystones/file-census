@@ -16,7 +16,8 @@ Usage:
   qc.py --list               show detected drives and exit
   qc.py E: --db PATH.sqlite  put the catalog somewhere specific
 
-Windows-only. Python 3.12+ (os.listdrives). Standard library only.
+Windows-only. Python 3.11+ standard library only (on 3.12+ drive discovery uses
+os.listdrives; older versions fall back to a Win32 call).
 """
 from __future__ import annotations
 
@@ -93,6 +94,8 @@ _k32.GetVolumeInformationW.argtypes = [
 ]
 _k32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
 _k32.GetDriveTypeW.restype = wintypes.UINT
+_k32.GetLogicalDrives.argtypes = []
+_k32.GetLogicalDrives.restype = wintypes.DWORD
 DRIVE_TYPE_NAMES = {0: "unknown", 1: "invalid", 2: "removable", 3: "fixed",
                     4: "remote", 5: "cdrom", 6: "ramdisk"}
 
@@ -117,9 +120,19 @@ def human(n) -> str:
     return f"{n:.1f} TiB"
 
 
+def _list_drive_roots() -> list[str]:
+    """os.listdrives() needs Python 3.12+; older Pythons fall back to the
+    GetLogicalDrives bitmask (bit 0 = A:, bit 1 = B:, …)."""
+    try:
+        return os.listdrives()
+    except AttributeError:
+        mask = _k32.GetLogicalDrives()
+        return [f"{chr(65 + i)}:\\" for i in range(26) if mask & (1 << i)]
+
+
 def detect_drives() -> list[dict]:
     out = []
-    for root in os.listdrives():
+    for root in _list_drive_roots():
         drive = root.rstrip("\\")
         dtype = DRIVE_TYPE_NAMES.get(_k32.GetDriveTypeW(root), "unknown")
         label = fs = serial = None
