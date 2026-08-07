@@ -140,6 +140,54 @@ class Model:
             cur = r["parent_id"]
         return "\\".join(reversed(parts))
 
+    def scan_paths(self, scan_id: int) -> dict[str, tuple[str, bool, int, int]]:
+        """rel-path(casefold) -> (display rel path, is_dir, size, mtime) for one scan.
+        Paths are relative to the drive root so scans of re-lettered drives still compare."""
+        rows = self.con.execute(
+            "SELECT entry_id, parent_id, name, is_dir, size_bytes, mtime_ns "
+            "FROM entry WHERE scan_id=? ORDER BY depth ASC", (scan_id,)).fetchall()
+        rel: dict[int, str] = {}
+        out: dict[str, tuple[str, bool, int, int]] = {}
+        for r in rows:
+            if r["parent_id"] is None:
+                rel[r["entry_id"]] = ""
+                continue
+            p = rel[r["parent_id"]]
+            mine = f"{p}\\{r['name']}" if p else r["name"]
+            if r["is_dir"]:
+                rel[r["entry_id"]] = mine
+            out[mine.casefold()] = (mine, bool(r["is_dir"]), r["size_bytes"] or 0, r["mtime_ns"] or 0)
+        return out
+
+    def diff_scans(self, scan_a: int, scan_b: int) -> dict:
+        """Path-keyed A->B comparison. Statuses: added (in B only), removed (in A only),
+        changed (file in both, size or mtime differs). Directory mtime drift is ignored
+        (it changes whenever children change — pure noise at this level)."""
+        a = self.scan_paths(scan_a)
+        b = self.scan_paths(scan_b)
+        changes = []
+        for key, (disp, is_dir, size_b, mtime_b) in b.items():
+            if key not in a:
+                changes.append({"rel": disp, "is_dir": is_dir, "status": "added",
+                                "size_a": None, "size_b": size_b, "mtime_b": mtime_b})
+            elif not is_dir:
+                _, _, size_a, mtime_a = a[key]
+                if size_a != size_b or mtime_a != mtime_b:
+                    changes.append({"rel": disp, "is_dir": False, "status": "changed",
+                                    "size_a": size_a, "size_b": size_b, "mtime_b": mtime_b})
+        for key, (disp, is_dir, size_a, mtime_a) in a.items():
+            if key not in b:
+                changes.append({"rel": disp, "is_dir": is_dir, "status": "removed",
+                                "size_a": size_a, "size_b": None, "mtime_b": mtime_a})
+        n_add = sum(1 for c in changes if c["status"] == "added" and not c["is_dir"])
+        n_rem = sum(1 for c in changes if c["status"] == "removed" and not c["is_dir"])
+        n_chg = sum(1 for c in changes if c["status"] == "changed")
+        net = (sum(c["size_b"] for c in changes if c["status"] == "added" and not c["is_dir"])
+               - sum(c["size_a"] for c in changes if c["status"] == "removed" and not c["is_dir"])
+               + sum(c["size_b"] - c["size_a"] for c in changes if c["status"] == "changed"))
+        return {"changes": changes,
+                "summary": {"added": n_add, "removed": n_rem, "changed": n_chg, "net": net}}
+
 
 def run_viewer(db_path: str | None):
     import tkinter as tk
@@ -163,6 +211,8 @@ def run_viewer(db_path: str | None):
     min_var = tk.IntVar(value=GROUP_MIN_DEFAULT)
     tk.Spinbox(bar, from_=2, to=999, width=4, textvariable=min_var,
                command=lambda: reload_tree()).pack(side="left")
+    diff_btn = tk.Button(bar, text="Diff…", state="disabled", command=lambda: open_diff())
+    diff_btn.pack(side="left", padx=(14, 0))
 
     tree = ttk.Treeview(root, columns=("type", "date", "size", "items"), selectmode="browse")
     tree.heading("#0", text="Name", anchor="w")
@@ -259,6 +309,11 @@ def run_viewer(db_path: str | None):
                            f"{s['dir_count']:,} folders, {human(s['byte_total'])}, "
                            f"scanned {s['started_utc']}")
 
+    def scan_label(s) -> str:
+        return (f"scan {s['scan_id']}: {s['drive']} {s['label'] or ''} — "
+                f"{(s['file_count'] or 0):,} files, {human(s['byte_total'] or 0)} "
+                f"({(s['started_utc'] or '')[:10]})")
+
     def open_db(path: str):
         try:
             state["model"] = Model(path)
@@ -266,13 +321,166 @@ def run_viewer(db_path: str | None):
             messagebox.showerror("quick census viewer", f"Cannot open {path}:\n{e}")
             return
         m = state["model"]
-        scan_box["values"] = [
-            f"scan {s['scan_id']}: {s['drive']} {s['label'] or ''} — "
-            f"{(s['file_count'] or 0):,} files, {human(s['byte_total'] or 0)} ({(s['started_utc'] or '')[:10]})"
-            for s in m.scans]
+        scan_box["values"] = [scan_label(s) for s in m.scans]
         scan_box.current(len(m.scans) - 1)
+        diff_btn.config(state="normal" if len(m.scans) >= 2 else "disabled")
         root.title(f"quick census viewer — {os.path.basename(path)}")
         show_scan(len(m.scans) - 1)
+
+    def signed(n: int) -> str:
+        return ("+" if n >= 0 else "−") + human(abs(n))
+
+    def open_diff():
+        m = state["model"]
+        dlg = tk.Toplevel(root)
+        dlg.title("Compare scans")
+        dlg.transient(root)
+        labels = [scan_label(s) for s in m.scans]
+        tk.Label(dlg, text="A (before):").grid(row=0, column=0, sticky="e", padx=8, pady=6)
+        tk.Label(dlg, text="B (after):").grid(row=1, column=0, sticky="e", padx=8)
+        va, vb = tk.StringVar(), tk.StringVar()
+        ca = ttk.Combobox(dlg, textvariable=va, values=labels, width=60, state="readonly")
+        cb = ttk.Combobox(dlg, textvariable=vb, values=labels, width=60, state="readonly")
+        ca.grid(row=0, column=1, padx=8, pady=6)
+        cb.grid(row=1, column=1, padx=8)
+        ca.current(len(m.scans) - 2)
+        cb.current(len(m.scans) - 1)
+        warn = tk.Label(dlg, text="", fg="#9a6700")
+        warn.grid(row=2, column=0, columnspan=2)
+
+        def note(*_):
+            sa, sb = m.scans[ca.current()], m.scans[cb.current()]
+            warn.config(text="different drives — comparing relative structure only"
+                        if sa["drive"] != sb["drive"] else "")
+        ca.bind("<<ComboboxSelected>>", note)
+        cb.bind("<<ComboboxSelected>>", note)
+        note()
+
+        def go():
+            ia, ib = ca.current(), cb.current()
+            dlg.destroy()
+            if ia == ib:
+                messagebox.showinfo("Compare scans", "Pick two different scans.")
+                return
+            show_diff(ia, ib)
+        tk.Button(dlg, text="Compare", width=12, command=go).grid(row=3, column=1, sticky="e",
+                                                                  padx=8, pady=8)
+
+    def show_diff(idx_a: int, idx_b: int):
+        m = state["model"]
+        sa, sb = m.scans[idx_a], m.scans[idx_b]
+        root.config(cursor="watch")
+        root.update_idletasks()
+        result = m.diff_scans(sa["scan_id"], sb["scan_id"])
+        root.config(cursor="")
+
+        win = tk.Toplevel(root)
+        win.title(f"diff: scan {sa['scan_id']} → scan {sb['scan_id']}")
+        win.geometry("980x600")
+        s = result["summary"]
+        tk.Label(win, anchor="w",
+                 text=f"{scan_label(sa)}   →   {scan_label(sb)}").pack(fill="x", padx=8, pady=(6, 0))
+        tk.Label(win, anchor="w", font=("Segoe UI", 10, "bold"),
+                 text=f"+{s['added']} added   −{s['removed']} removed   ~{s['changed']} changed"
+                      f"   net {signed(s['net'])}").pack(fill="x", padx=8)
+
+        fbar = tk.Frame(win)
+        fbar.pack(fill="x", padx=8)
+        shows = {k: tk.BooleanVar(value=True) for k in ("added", "removed", "changed")}
+        for k, v in shows.items():
+            tk.Checkbutton(fbar, text=f"show {k}", variable=v,
+                           command=lambda: rebuild()).pack(side="left")
+
+        dtree = ttk.Treeview(win, columns=("status", "type", "size", "modified"), selectmode="browse")
+        dtree.heading("#0", text="Name", anchor="w")
+        for col, txt, wdt, anch in (("status", "Status", 110, "w"), ("type", "Type", 80, "w"),
+                                    ("size", "Size", 170, "e"), ("modified", "Modified", 120, "w")):
+            dtree.heading(col, text=txt, anchor=anch)
+            dtree.column(col, width=wdt, anchor=anch, stretch=False)
+        dtree.column("#0", width=430)
+        dtree.tag_configure("added", foreground="#1a7f37")
+        dtree.tag_configure("removed", foreground="#cf222e")
+        dtree.tag_configure("changed", foreground="#9a6700")
+        dys = ttk.Scrollbar(win, orient="vertical", command=dtree.yview)
+        dtree.configure(yscrollcommand=dys.set)
+        dys.pack(side="right", fill="y")
+        dtree.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+
+        def rebuild():
+            dtree.delete(*dtree.get_children(""))
+            active = [c for c in result["changes"] if shows[c["status"]].get()]
+            active.sort(key=lambda c: natural_key(c["rel"]))
+            nodes: dict[str, str] = {}      # rel casefold -> iid
+            containers: dict[str, list] = {}  # pure ancestor rows -> [a, r, c, net]
+
+            def ensure_chain(rel_display: str) -> str:
+                """Create/find container rows for every ancestor of rel; returns parent iid."""
+                parts = rel_display.split("\\")
+                parent = ""
+                sofar = ""
+                for seg in parts[:-1]:
+                    sofar = f"{sofar}\\{seg}" if sofar else seg
+                    key = sofar.casefold()
+                    if key not in nodes:
+                        iid = dtree.insert(parent, "end", f"d|{key}", text="📁 " + seg,
+                                           values=("", "folder", "", ""))
+                        nodes[key] = iid
+                        containers[key] = [0, 0, 0, 0]
+                    parent = nodes[key]
+                return parent
+
+            for c in active:
+                parent = ensure_chain(c["rel"])
+                name = c["rel"].rsplit("\\", 1)[-1]
+                # roll file-level churn into every ancestor container
+                if not c["is_dir"] or c["status"] != "changed":
+                    sofar = ""
+                    for seg in c["rel"].split("\\")[:-1]:
+                        sofar = f"{sofar}\\{seg}" if sofar else seg
+                        agg = containers.get(sofar.casefold())
+                        if agg is not None:
+                            if not c["is_dir"]:
+                                if c["status"] == "added":
+                                    agg[0] += 1
+                                    agg[3] += c["size_b"]
+                                elif c["status"] == "removed":
+                                    agg[1] += 1
+                                    agg[3] -= c["size_a"]
+                                else:
+                                    agg[2] += 1
+                                    agg[3] += c["size_b"] - c["size_a"]
+                if c["status"] == "changed":
+                    size_txt = f"{human(c['size_a'])} → {human(c['size_b'])}"
+                elif c["status"] == "added":
+                    size_txt = "" if c["is_dir"] else human(c["size_b"])
+                else:
+                    size_txt = "" if c["is_dir"] else human(c["size_a"])
+                icon = "📁 " if c["is_dir"] else ""
+                typ = "folder" if c["is_dir"] else (os.path.splitext(name)[1][1:].lower() or "file")
+                key = c["rel"].casefold()
+                iid = dtree.insert(parent, "end", f"c|{key}", text=icon + name,
+                                   values=(c["status"], typ, size_txt, fmt_dt(c["mtime_b"])),
+                                   tags=(c["status"],))
+                nodes[key] = iid  # children of an added/removed dir nest under its colored row
+
+            for key, (a, r, ch, net) in containers.items():
+                badge = " ".join(x for x in (f"+{a}" if a else "", f"−{r}" if r else "",
+                                             f"~{ch}" if ch else "") if x)
+                dtree.set(nodes[key], "status", badge)
+                if net:
+                    dtree.set(nodes[key], "size", signed(net))
+
+            def open_all(iid, depth):
+                if depth <= 0:
+                    return
+                dtree.item(iid, open=True)
+                for k in dtree.get_children(iid):
+                    open_all(k, depth - 1)
+            depth = 99 if len(active) <= 400 else 2
+            for k in dtree.get_children(""):
+                open_all(k, depth)
+
+        rebuild()
 
     def pick_file():
         p = filedialog.askopenfilename(
