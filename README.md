@@ -12,17 +12,55 @@ records what directory enumeration alone provides — **no file is ever opened**
 
 Intended for non-sensitive drives where filenames are not a privacy concern.
 
-## Guarantees
+## Safety & privacy model
 
-- **Zero writes to scanned drives.** The only artifact is the SQLite catalog,
-  and qc.py refuses to place it on a drive being scanned unless you pass
-  `--allow-db-on-scanned` (then the db file itself is excluded from the census).
-- **No file handles.** Metadata comes from the directory listing (`os.scandir`);
-  contents are never read, nothing is hashed, locked files cannot block it.
-- Junction/symlink subtrees are not descended (cycle-safe); access-denied
-  directories are recorded in `scan_error` and the walk continues.
-- Ctrl-C aborts cleanly: finished drives keep status `done`, the interrupted
-  scan is marked `aborted`.
+**Safety of the scanned drives is structural, not promised.** The tool contains
+no code path that opens a file: metadata comes from directory listings
+(`os.scandir`), so nothing can be modified, locked, executed, or hydrated by a
+scan, and locked files cannot block it. The only artifact written anywhere is
+the catalog + summary pair, and qc.py refuses to place them on a drive being
+scanned unless you pass `--allow-db-on-scanned` (the catalog file is then
+excluded from its own census). There are zero network calls — standard library
+only, no sockets — and nothing runs elevated. The one non-file handle the tool
+opens is a *zero-access* volume-device handle for the hardware-identity query;
+zero access means it can neither read nor write anything.
+
+**Cloud placeholders (OneDrive Files On-Demand).** The trigger boundary is:
+enumerating and stat-ing placeholders is safe; opening a file and reading its
+bytes hydrates (downloads) it. qc never reads bytes, so it can never download
+content. By default it does not even *enter* online-only folders (they appear
+as single cloud-tagged rows) — entering them is a deliberate opt-in
+(`--include-cloud`, or the GUI checkbox, default off) because enumerating an
+online-only folder can make the sync client materialize child placeholder
+stubs: a metadata network event, still zero content download. When you opt in,
+the GUI suggests a private catalog location (see below).
+
+**Privacy of the catalog itself.** A catalog lists every filename on a drive —
+treat it as sensitive. The tool never transmits it (no telemetry, no uploads;
+this repo also gitignores `census_*` files so catalogs cannot ride along on a
+push). Beyond that, protection is exactly Windows file permissions on wherever
+the catalog sits — with two honest caveats: other *administrators* of the same
+machine can read any file regardless of ACLs, and **if the catalog lands inside
+a cloud-synced folder it will sync to the cloud like anything else**. That is
+the easiest accidental leak; keep catalogs out of sync roots (for example
+`%LOCALAPPDATA%\quickcensus`, which the GUI suggests when the cloud checkbox
+is on).
+
+**Drive identity captured per scan** (all unelevated, recorded in the `scan`
+row and the summary txt):
+- *volume serial* — stamped at format time, stored on the volume, travels with
+  the drive across machines and letter changes; 32-bit, so treat as a strong
+  hint, not proof;
+- *volume GUID* — unique and stable on this machine across letter changes, but
+  assigned per Windows install (does not travel);
+- *hardware product + serial* — the physical device's own identity via a
+  zero-access `IOCTL_STORAGE_QUERY_PROPERTY`; survives reformatting; USB
+  bridges occasionally report the enclosure or nothing.
+
+Also: junction/symlink subtrees are never descended (cycle-safe); access-denied
+directories are recorded in `scan_error` and the walk continues; Ctrl-C aborts
+cleanly (finished drives keep status `done`, the interrupted scan is marked
+`aborted`).
 
 ## Usage
 
