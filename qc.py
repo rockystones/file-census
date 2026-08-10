@@ -1032,7 +1032,22 @@ def main(argv=None) -> int:
         return 2
     if not require_supported_python("qc.py"):
         return 2
-    p = argparse.ArgumentParser(description="quick read-only metadata census into SQLite")
+    p = argparse.ArgumentParser(
+        description="quick read-only metadata census into SQLite",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  qc.py                      GUI picker (needs tkinter — optional; see below)
+  qc.py --list               show detected drives / mounts
+  qc.py C: E:                census Windows drives
+  qc.py /mnt                 census a Linux mount (mount points come from /proc/mounts)
+  qc.py /mnt --only /mnt/data/projects --only /mnt/data/raw
+  qc.py E: --db D:\\catalogs\\lab.sqlite --sort name:asc --top 50
+
+common error: "tkinter is not installed, so the GUI can't open."
+  The GUI is optional — every feature has a CLI twin (drives as arguments,
+  --only for folder limiting, --db/--sort/--top). To get the GUI on Linux:
+  sudo apt install python3-tk   (Debian/Ubuntu)
+  sudo dnf install python3-tkinter   (Fedora)      conda install tk   (Anaconda)""")
     p.add_argument("drives", nargs="*", help="drive letters like C: E: (omit for a GUI picker)")
     p.add_argument("--db", default=None,
                    help="catalog database path (default: census_<letters>_drive_<YYYYMMDDHHMM>.sqlite beside qc.py)")

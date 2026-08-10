@@ -77,6 +77,19 @@ python qc.py E: --db D:\catalogs\home.sqlite
 python qc.py C: --only C:\Data --only C:\Projects   # scoped census (see below)
 ```
 
+**Common error (Linux):** `tkinter is not installed, so the GUI can't open.`
+Many Linux Pythons ship without tkinter — and the GUI is entirely optional:
+every feature has a CLI twin, validated on a real Linux box:
+
+```
+python qc.py --list                # mounts with label/fs/size — works without tkinter
+python qc.py /mnt                  # full census of a mount — works without tkinter
+python qc.py /mnt --only /mnt/data/projects
+```
+
+To get the GUI: `sudo apt install python3-tk` (Debian/Ubuntu),
+`sudo dnf install python3-tkinter` (Fedora), or `conda install tk` (Anaconda).
+
 **Scoped census.** By default a census covers the whole drive. To limit it,
 tick "Limit census to selected folders" in the popup and use **Choose
 folders…** — a lazy folder tree of the ticked drives where clicking a folder
