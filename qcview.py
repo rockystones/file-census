@@ -210,8 +210,14 @@ class Model:
 
 
 def run_viewer(db_path: str | None):
-    import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+    try:
+        import tkinter as tk
+        from tkinter import filedialog, messagebox, ttk
+    except ImportError:
+        print("qcview needs tkinter. Install it with: sudo apt install python3-tk "
+              "(Debian/Ubuntu), sudo dnf install python3-tkinter (Fedora), or "
+              "conda install tk.", file=sys.stderr)
+        sys.exit(2)
 
     root = tk.Tk()
     root.title("quick census viewer")
@@ -535,8 +541,8 @@ def run_viewer(db_path: str | None):
 
 
 def main() -> int:
-    if os.name != "nt":
-        print("qcview.py is Windows-only (matches qc.py catalogs)", file=sys.stderr)
+    if os.name not in ("nt", "posix"):
+        print("qcview.py supports Windows and Linux", file=sys.stderr)
         return 2
     from qc import require_supported_python
     if not require_supported_python("qcview.py"):

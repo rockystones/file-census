@@ -338,7 +338,12 @@ def pick_drives_gui(drives: list[dict], explicit_db: str | None, auto_dir: str,
         import tkinter as tk
         from tkinter import filedialog, messagebox
     except ImportError:
-        print("tkinter unavailable — pass drive letters on the command line (see --help)",
+        what = "drive letters like C: E:" if IS_WIN else "mount points like / or /mnt/data"
+        hint = ("" if IS_WIN else
+                "  Install it with: sudo apt install python3-tk (Debian/Ubuntu), "
+                "sudo dnf install python3-tkinter (Fedora), or conda install tk.\n")
+        print(f"tkinter is not installed, so the GUI can't open.\n{hint}"
+              f"  Or skip the GUI: pass {what} on the command line (see --help).",
               file=sys.stderr)
         sys.exit(2)
     root = tk.Tk()
