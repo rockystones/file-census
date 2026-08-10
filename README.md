@@ -1,8 +1,13 @@
 # quickcensus — read-only whole-drive metadata census
 
-One file, standard library only, Windows, Python 3.11+ (Anaconda base works;
-on 3.12+ drive discovery uses `os.listdrives`, older versions fall back to a
-Win32 call). Walks entire drives and
+One file, standard library only, **Windows + Linux**, Python 3.11+ (Anaconda
+base works). On Windows, drives are letters and identity comes from Win32
+volume/device queries; on Linux, "drives" are block-device mount points from
+`/proc/mounts` and identity comes from `lsblk` (filesystem UUID → volume
+serial, PARTUUID → volume GUID, device model+serial → hardware). Linux scans
+never follow symlinks and never cross into other filesystems (foreign mount
+points are recorded like junctions); case sensitivity is respected per
+platform. Walks entire drives and
 records what directory enumeration alone provides — **no file is ever opened**:
 
 - names + full folder structure (parent/child tree)
@@ -66,10 +71,22 @@ cleanly (finished drives keep status `done`, the interrupted scan is marked
 
 ```
 python qc.py               # popup: tick drives, set the catalog path/name, Scan
-python qc.py C: E:         # no popup
-python qc.py --list        # show detected drives
+python qc.py C: E:         # no popup (Linux: python qc.py / /mnt/data)
+python qc.py --list        # show detected drives / mounts
 python qc.py E: --db D:\catalogs\home.sqlite
+python qc.py C: --only C:\Data --only C:\Projects   # scoped census (see below)
 ```
+
+**Scoped census.** By default a census covers the whole drive. To limit it,
+tick "Limit census to selected folders" in the popup and use **Choose
+folders…** — a lazy folder tree of the ticked drives where clicking a folder
+ticks/unticks it (☑ includes its whole subtree; nested selections are
+deduplicated; drive roots can't be ticked because unlimited is the default).
+The CLI twin is repeatable `--only <folder>`. A scoped catalog still
+reconstructs full paths (ancestor folders get rows without their siblings
+being enumerated), the scan records its scope in the `scan.scope` column, and
+the summary txt states the scope prominently — so a limited census can never
+be mistaken for full drive coverage.
 
 The default catalog name encodes the selection and the moment:
 `census_E_drive_202608061920.sqlite` (letters of the chosen drives + local

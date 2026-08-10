@@ -49,10 +49,15 @@ figcaption { color: var(--dim); font-size: 13px; margin-top: 6px; }
 <main>
 
 <h1>qc.py — quick drive census, explained</h1>
-<p class="sub">One Python file (~330 lines, standard library only) that walks entire Windows
+<p class="sub">One Python file (standard library only, Windows + Linux) that walks entire
 drives and stores every file and folder's metadata in a SQLite database — without ever
-opening a file. This document explains what it calls, what it defines, and how the pieces
-run together.</p>
+opening a file. On Linux, "drives" are block-device mount points, identity comes from
+<code>lsblk</code> (fs UUID / PARTUUID / model+serial), symlinks map to the symlink reparse
+tag and foreign mount points to the junction tag, and scans stay on one filesystem. A census
+can also be <strong>scoped</strong> to selected folders (GUI folder-tree picker or repeatable
+<code>--only</code>): ancestor folders get rows so paths reconstruct, siblings are never
+enumerated, and the scan records its scope so limited coverage is always visible. This
+document explains what it calls, what it defines, and how the pieces run together.</p>
 
 <!-- ============================================================ -->
 <h2>1 · The libraries doing the heavy lifting</h2>

@@ -68,7 +68,18 @@ class Model:
         if not self.scans:
             raise ValueError("no scans in this catalog")
 
+    def _scan_conventions(self, scan_id: int) -> tuple[str, bool]:
+        """(separator, casefold?) for a scan: Windows scans use '\\' + case-insensitive
+        matching; posix scans use '/' + exact case. Old catalogs lack the platform
+        column — infer from the root name."""
+        s = next(x for x in self.scans if x["scan_id"] == scan_id)
+        platform = s["platform"] if "platform" in s.keys() else None
+        drive = str(s["drive"])
+        posix = platform == "posix" or (platform is None and drive.startswith("/"))
+        return ("/" if posix else "\\"), (not posix)
+
     def load_scan(self, scan_id: int):
+        self.sep, self.fold_case = self._scan_conventions(scan_id)
         self.info: dict[int, sqlite3.Row] = {}
         self.children: dict[int, list[int]] = defaultdict(list)
         self.agg: dict[int, list[int]] = {}  # folder id -> [recursive bytes, recursive files]
@@ -132,17 +143,24 @@ class Model:
         return out
 
     def path_of(self, entry_id: int) -> str:
+        sep = getattr(self, "sep", "\\")
         parts = []
         cur = entry_id
         while cur is not None:
             r = self.info[cur]
             parts.append(r["name"])
             cur = r["parent_id"]
-        return "\\".join(reversed(parts))
+        parts.reverse()
+        if parts and parts[0].endswith(sep):  # posix root '/' would otherwise double the sep
+            return parts[0] + sep.join(parts[1:])
+        return sep.join(parts)
 
     def scan_paths(self, scan_id: int) -> dict[str, tuple[str, bool, int, int]]:
-        """rel-path(casefold) -> (display rel path, is_dir, size, mtime) for one scan.
-        Paths are relative to the drive root so scans of re-lettered drives still compare."""
+        """rel-path key -> (display rel path, is_dir, size, mtime) for one scan.
+        Paths are relative to the drive root so scans of re-lettered drives still
+        compare; keys casefold on Windows scans, stay exact on posix scans."""
+        sep, fold = self._scan_conventions(scan_id)
+        key = (lambda s: s.casefold()) if fold else (lambda s: s)
         rows = self.con.execute(
             "SELECT entry_id, parent_id, name, is_dir, size_bytes, mtime_ns "
             "FROM entry WHERE scan_id=? ORDER BY depth ASC", (scan_id,)).fetchall()
@@ -153,10 +171,10 @@ class Model:
                 rel[r["entry_id"]] = ""
                 continue
             p = rel[r["parent_id"]]
-            mine = f"{p}\\{r['name']}" if p else r["name"]
+            mine = f"{p}{sep}{r['name']}" if p else r["name"]
             if r["is_dir"]:
                 rel[r["entry_id"]] = mine
-            out[mine.casefold()] = (mine, bool(r["is_dir"]), r["size_bytes"] or 0, r["mtime_ns"] or 0)
+            out[key(mine)] = (mine, bool(r["is_dir"]), r["size_bytes"] or 0, r["mtime_ns"] or 0)
         return out
 
     def diff_scans(self, scan_a: int, scan_b: int) -> dict:
