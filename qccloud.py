@@ -40,6 +40,59 @@ SCOPE = "https://graph.microsoft.com/Files.Read"
 SELECT = "id,name,size,parentReference,file,folder,fileSystemInfo,root"
 
 
+MSA_TENANT = "9188040d-6c67-4c5b-b112-36a304b66dad"  # Microsoft's personal-account directory
+REGISTER_APP = ("See 'Registering your own app' in README.md — 5 minutes, no cost. In short:\n"
+                "  Entra portal > App registrations > New registration\n"
+                "    - account types: include personal Microsoft accounts if you use a\n"
+                "      personal OneDrive\n"
+                "    - Authentication > Allow public client flows: YES  (device code needs it)\n"
+                "    - API permissions > Microsoft Graph > Delegated > Files.Read\n"
+                "  then rerun with --client-id <Application (client) ID>")
+
+
+def _signin_guidance(msg: str, tenant: str, client_id: str) -> str:
+    """Translate an AADSTS error into the next thing to try."""
+    m = msg or ""
+    if "AADSTS50059" in m:
+        return ("What it means: Entra could not tell which tenant to sign you in to — the\n"
+                "'common' endpoint cannot infer one before you have signed in.\n"
+                "Try:  --tenant consumers        (personal @outlook/@hotmail/@live account)\n"
+                "      --tenant organizations    (work or school account)\n"
+                "      --tenant yourschool.edu   (or the tenant GUID) to name it exactly")
+    if "AADSTS700016" in m:
+        who = ("personal Microsoft accounts" if MSA_TENANT in m else f"tenant {tenant!r}")
+        extra = ("\nThe default client (Microsoft Graph Command Line Tools) is not available to\n"
+                 "personal Microsoft accounts, so a personal OneDrive always needs your own app."
+                 if MSA_TENANT in m else
+                 "\nYour tenant has not installed/consented to this first-party client.")
+        return (f"What it means: client {client_id} does not exist for {who}.{extra}\n\n"
+                + REGISTER_APP)
+    if "AADSTS7000218" in m or "client_assertion" in m or "client_secret" in m:
+        return ("What it means: your app registration is not marked as a public client, so Entra\n"
+                "expects a client secret that device-code flow does not use.\n"
+                "Fix: Entra portal > your app > Authentication > Advanced settings >\n"
+                "     'Allow public client flows' = Yes, then Save and rerun.")
+    if "AADSTS50020" in m:
+        return ("What it means: that account does not exist in the tenant you named.\n"
+                f"You used --tenant {tenant!r}; sign in with a matching account, or switch to\n"
+                "--tenant consumers (personal) / organizations (work).")
+    if "AADSTS65001" in m or "consent" in m.lower():
+        return ("What it means: the permission has not been consented to.\n"
+                "If this is a work tenant you may need an administrator to grant Files.Read\n"
+                "for the app (Entra portal > your app > API permissions > Grant admin consent).")
+    if "AADSTS900023" in m or "invalid_tenant" in m.lower():
+        return (f"What it means: {tenant!r} is not a recognized tenant.\n"
+                "Use 'consumers', 'organizations', a verified domain, or the tenant GUID.")
+    return REGISTER_APP
+
+
+def _fail_signin(stage: str, payload: dict, tenant: str, client_id: str):
+    msg = payload.get("error_description") or json.dumps(payload)
+    print(f"\n{stage} failed.\n\n{msg.strip()}\n\n"
+          f"{_signin_guidance(msg, tenant, client_id)}\n", file=sys.stderr)
+    sys.exit(2)
+
+
 def _post_form(url: str, data: dict) -> dict:
     req = urllib.request.Request(url, data=urllib.parse.urlencode(data).encode(),
                                  headers={"Content-Type": "application/x-www-form-urlencoded"})
@@ -55,9 +108,10 @@ def device_code_signin(tenant: str, client_id: str) -> str:
     dc = _post_form(f"{LOGIN}/{tenant}/oauth2/v2.0/devicecode",
                     {"client_id": client_id, "scope": SCOPE})
     if "user_code" not in dc:
-        sys.exit(f"sign-in setup failed: {dc.get('error_description', dc)}")
+        _fail_signin("sign-in setup", dc, tenant, client_id)
     print(f"\n  To sign in: open {dc['verification_uri']} and enter code {dc['user_code']}\n"
-          f"  (read-only Files.Read scope; nothing is stored after this run)\n")
+          f"  (read-only Files.Read scope; no credential is stored — the token lives in\n"
+          f"   memory for this run only, and no refresh token is requested)\n")
     interval = int(dc.get("interval", 5))
     while True:
         time.sleep(interval)
@@ -72,10 +126,7 @@ def device_code_signin(tenant: str, client_id: str) -> str:
         if err == "slow_down":
             interval += 5
             continue
-        sys.exit(f"sign-in failed: {tok.get('error_description', tok)}\n"
-                 "If this is an organizational account that blocks the default client, "
-                 "register your own app (public client, delegated Files.Read) and pass "
-                 "--client-id.")
+        _fail_signin("sign-in", tok, tenant, client_id)
 
 
 def fetch_json(url: str, token: str, retries: int = 6) -> dict:

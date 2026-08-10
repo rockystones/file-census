@@ -134,6 +134,52 @@ python qccloud.py                     # device-code sign-in, census /me/drive
 python qccloud.py --tenant organizations --client-id <your-app-guid>
 ```
 
+### Choosing the tenant
+
+`--tenant` decides which sign-in authority is used, and getting it wrong is the
+most common first failure:
+
+| account | flag |
+|---|---|
+| personal (@outlook / @hotmail / @live) | `--tenant consumers` |
+| work or school | `--tenant organizations`, or the exact domain / tenant GUID |
+
+The default `common` often fails with **AADSTS50059** ("no tenant-identifying
+information"), because a device-code request is created *before* you sign in,
+so there is no username for Entra to infer a tenant from. The tool now
+translates that error — and the other common AADSTS codes — into the next thing
+to try.
+
+### Registering your own app
+
+Required for **personal OneDrive** (Microsoft's default first-party client does
+not exist in the personal-account directory — error **AADSTS700016**), and for
+work tenants that have not consented to that client. Five minutes, no cost:
+
+1. Open the [Entra portal](https://entra.microsoft.com) → **App registrations**
+   → **New registration**. (Signing in with a personal Microsoft account
+   creates a free default directory for you.)
+2. **Name** it anything (e.g. `quickcensus`). **Supported account types**: pick
+   *"Accounts in any organizational directory … and personal Microsoft
+   accounts"* if you will census a personal OneDrive; work-only is fine
+   otherwise. Leave **Redirect URI** empty — device-code flow does not use one.
+   Click **Register**.
+3. Copy the **Application (client) ID** from the overview page.
+4. **Authentication** → *Advanced settings* → **Allow public client flows =
+   Yes** → Save. This step is easy to miss and its absence fails later with
+   **AADSTS7000218** ("client_assertion or client_secret required").
+5. **API permissions** → *Add a permission* → **Microsoft Graph** → *Delegated
+   permissions* → tick **Files.Read** → Add. On a work tenant an administrator
+   may need to click **Grant admin consent**.
+6. Run it:
+
+```
+python qccloud.py --tenant consumers --client-id <application-client-id>
+```
+
+Your own registration is also the better long-term choice for the work account:
+consent, audit trail, and revocation all sit under an app you control.
+
 Catalogs a OneDrive **from the cloud side** via Microsoft Graph — the local
 filesystem is never touched, so hydration cannot occur, and online-only files
 are covered by definition. Safety model: delegated device-code sign-in with
