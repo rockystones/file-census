@@ -127,6 +127,35 @@ orders what is shown, and the section header records which sort was used.
 Each run adds a new `scan` row per drive — history accumulates in one catalog,
 so two scans of the same drive can be compared later.
 
+## When qc.py can't read a tree: qcexport.ps1 + qcimport.py
+
+Sometimes the tree is readable by *you*, in a shell, on that machine — but not
+by a qc.py run (permission scoping, no Python installed, an OneDrive root only
+the logged-on user can enumerate). Two small pieces cover that, and no cloud
+sign-in is involved:
+
+```
+rem  1. on that machine, from cmd.exe — metadata only, no file is opened
+powershell -ExecutionPolicy Bypass -File qcexport.ps1 -Path "C:\Users\me\OneDrive"
+
+rem  2. anywhere, on the CSV it produced
+python qcimport.py qcexport_OneDrive_202608102230.csv --label "Work laptop"
+```
+
+`qcexport.ps1` walks with an explicit stack (no infinite recursion), records
+junction/symlink directories without descending into them unless `-FollowLinks`
+is given, keeps a visited-path guard and a `-MaxDepth` cap, logs unreadable
+folders to a sidecar `.errors.txt`, and writes UTF-8 CSV so non-ASCII names
+survive. It never opens a file, so it cannot hydrate a cloud placeholder.
+
+`qcimport.py` turns that CSV into an ordinary catalog — recorded as a **scoped
+scan** whose scope is the folder you listed, so a partial listing can never be
+mistaken for whole-drive coverage. Pass `--serial <volume serial>` to tie the
+listing to other scans of the same drive. The result opens in qcview and diffs
+scan-vs-scan like any other catalog. Verified end-to-end: an exported+imported
+tree matches a direct `qc.py --only` scan of the same folder exactly — same
+files, same sizes, same timestamps to the nanosecond.
+
 ## OneDrive census: qccloud.py
 
 ```
