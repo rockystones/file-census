@@ -75,6 +75,8 @@ class Model:
         s = next(x for x in self.scans if x["scan_id"] == scan_id)
         platform = s["platform"] if "platform" in s.keys() else None
         drive = str(s["drive"])
+        if platform == "cloud" or drive.startswith("onedrive:"):
+            return "/", True  # OneDrive paths are '/'-joined and case-insensitive
         posix = platform == "posix" or (platform is None and drive.startswith("/"))
         return ("/" if posix else "\\"), (not posix)
 

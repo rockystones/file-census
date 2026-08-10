@@ -88,7 +88,8 @@ CREATE TABLE IF NOT EXISTS entry(
   attr        INTEGER,            -- FILE_ATTRIBUTE_* bits
   reparse_tag INTEGER,            -- set for junctions/symlinks; subtree NOT descended
   ext         TEXT,               -- lowercase, files only
-  depth       INTEGER NOT NULL    -- 0 = the drive root row
+  depth       INTEGER NOT NULL,   -- 0 = the drive root row
+  hash        TEXT                -- service-computed content hash (cloud scans); NULL locally
 );
 CREATE INDEX IF NOT EXISTS ix_entry_scan_parent ON entry(scan_id, parent_id);
 CREATE INDEX IF NOT EXISTS ix_entry_scan_ext    ON entry(scan_id, ext) WHERE is_dir = 0;
@@ -666,6 +667,9 @@ def open_db(path: str) -> sqlite3.Connection:
     for col in ("volume_guid", "hw_product", "hw_serial", "platform", "scope"):
         if col not in cols:
             con.execute(f"ALTER TABLE scan ADD COLUMN {col} TEXT")
+    ecols = {r[1] for r in con.execute("PRAGMA table_info(entry)")}
+    if "hash" not in ecols:
+        con.execute("ALTER TABLE entry ADD COLUMN hash TEXT")
     con.execute("PRAGMA synchronous = NORMAL")
     return con
 

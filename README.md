@@ -114,6 +114,29 @@ orders what is shown, and the section header records which sort was used.
 Each run adds a new `scan` row per drive — history accumulates in one catalog,
 so two scans of the same drive can be compared later.
 
+## OneDrive census: qccloud.py
+
+```
+python qccloud.py                     # device-code sign-in, census /me/drive
+python qccloud.py --tenant organizations --client-id <your-app-guid>
+```
+
+Catalogs a OneDrive **from the cloud side** via Microsoft Graph — the local
+filesystem is never touched, so hydration cannot occur, and online-only files
+are covered by definition. Safety model: delegated device-code sign-in with
+read-only `Files.Read` scope (you authenticate on Microsoft's page; the script
+never sees the password and holds the token in memory only — nothing is
+persisted); every request is metadata-only (`$select` excludes `downloadUrl`);
+throttling honors `Retry-After`. Each file also carries the service-computed
+`quickXorHash` into the catalog's `hash` column — content-grade dupe detection
+with zero bytes read (local scans leave the column NULL). The Graph
+`deltaLink` is stored per drive for future incremental runs. Default client is
+Microsoft's own Graph Command Line Tools public app; organizational tenants
+that block it need your own Entra registration (public client, delegated
+Files.Read) via `--client-id`. Cloud catalogs open in qcview like any other
+scan ('/', case-insensitive). Note the complement: Graph sees the *cloud*
+state — local-only unsynced files need a normal qc.py scan.
+
 ## Browsing a catalog: qcview.py
 
 ```
