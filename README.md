@@ -142,11 +142,19 @@ rem  2. anywhere, on the CSV it produced
 python qcimport.py qcexport_OneDrive_202608102230.csv --label "Work laptop"
 ```
 
-`qcexport.ps1` walks with an explicit stack (no infinite recursion), records
-junction/symlink directories without descending into them unless `-FollowLinks`
-is given, keeps a visited-path guard and a `-MaxDepth` cap, logs unreadable
-folders to a sidecar `.errors.txt`, and writes UTF-8 CSV so non-ASCII names
-survive. It never opens a file, so it cannot hydrate a cloud placeholder.
+`qcexport.ps1` walks with an explicit stack (no infinite recursion), keeps a
+visited-path guard and a `-MaxDepth` cap, logs unreadable folders to a sidecar
+`.errors.txt`, and writes UTF-8 CSV so non-ASCII names survive. It never opens
+a file, so it cannot hydrate a cloud placeholder.
+
+**Cloud folders vs links.** A OneDrive placeholder folder carries the same
+`ReparsePoint` attribute as a junction, so a naive "skip reparse points" rule
+lists *only the root level* of a OneDrive tree. The script tells them apart by
+`LinkType` — real junctions/symlinks report one, cloud folders do not — and by
+default **descends into cloud folders** (that is usually why you are running
+it) while recording junctions/symlinks without following them. `-SkipCloud`
+and `-FollowLinks` override each behaviour. The run summary states how many of
+each it saw, so silent skipping is visible.
 
 `qcimport.py` turns that CSV into an ordinary catalog — recorded as a **scoped
 scan** whose scope is the folder you listed, so a partial listing can never be

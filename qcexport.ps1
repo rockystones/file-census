@@ -23,13 +23,21 @@
 .PARAMETER FollowLinks
   Descend into junctions/symlinks too. Off by default (cycle-safe); a visited-path
   guard is applied either way.
+
+.PARAMETER SkipCloud
+  Do NOT descend into cloud placeholder folders (OneDrive online-only). By default
+  they ARE descended, because listing them is usually the reason for running this.
+  Cloud folders carry the same ReparsePoint attribute as junctions, so they are told
+  apart by LinkType: a real junction/symlink reports one, a cloud folder does not.
+  Enumeration reads metadata only and never downloads file content.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string[]]$Path,
     [string]$Out,
     [int]$MaxDepth = 64,
-    [switch]$FollowLinks
+    [switch]$FollowLinks,
+    [switch]$SkipCloud
 )
 
 $ErrorActionPreference = 'Continue'
@@ -45,7 +53,7 @@ $errPath = [System.IO.Path]::ChangeExtension($Out, '.errors.txt')
 $rows = New-Object System.Collections.Generic.List[object]
 $errors = New-Object System.Collections.Generic.List[string]
 $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-$nFiles = 0; $nDirs = 0; [long]$nBytes = 0
+$nFiles = 0; $nDirs = 0; [long]$nBytes = 0; $nCloud = 0; $nLinks = 0
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
 foreach ($rootRaw in $Path) {
@@ -90,7 +98,14 @@ foreach ($rootRaw in $Path) {
         foreach ($k in $kids) {
             $attr = [int]$k.Attributes
             $isDir = ($attr -band $FILE_ATTRIBUTE_DIRECTORY) -ne 0
-            $isLink = ($attr -band $FILE_ATTRIBUTE_REPARSE_POINT) -ne 0
+            $isReparse = ($attr -band $FILE_ATTRIBUTE_REPARSE_POINT) -ne 0
+            # A OneDrive placeholder folder carries ReparsePoint just like a junction.
+            # Only real junctions/symlinks report a LinkType, so use that to tell them
+            # apart: cloud folders are worth descending, link cycles are not.
+            $linkType = $null
+            if ($isReparse) { try { $linkType = $k.LinkType } catch { } }
+            $isRealLink = $isReparse -and ($linkType -and $linkType -ne 'HardLink')
+            $isCloud = $isReparse -and -not $isRealLink
             $rows.Add([PSCustomObject]@{
                 FullName         = $k.FullName
                 IsDir            = [int]$isDir
@@ -101,7 +116,10 @@ foreach ($rootRaw in $Path) {
             })
             if ($isDir) {
                 $nDirs++
-                if (-not $isLink -or $FollowLinks) { $stack.Push(@($k.FullName, $depth + 1)) }
+                $descend = (-not $isReparse) -or $FollowLinks -or ($isCloud -and -not $SkipCloud)
+                if ($isRealLink) { $nLinks++ }
+                elseif ($isCloud) { $nCloud++ }
+                if ($descend) { $stack.Push(@($k.FullName, $depth + 1)) }
             } else {
                 $nFiles++; $nBytes += $k.Length
             }
@@ -117,6 +135,17 @@ if ($errors.Count -gt 0) { $errors | Set-Content -LiteralPath $errPath -Encoding
 
 Write-Host ("`r  {0:N0} files, {1:N0} dirs, {2:N1} GiB, {3} unreadable, {4:N1}s" -f `
     $nFiles, $nDirs, ($nBytes / 1GB), $errors.Count, $sw.Elapsed.TotalSeconds)
+if ($nCloud -gt 0) {
+    $verb = if ($SkipCloud) { 'skipped (-SkipCloud)' } else { 'descended into' }
+    Write-Host ("  {0:N0} cloud placeholder folder(s) {1} - metadata only, no content downloaded" -f $nCloud, $verb)
+}
+if ($nLinks -gt 0) {
+    $verb = if ($FollowLinks) { 'followed (-FollowLinks)' } else { 'recorded but not followed' }
+    Write-Host ("  {0:N0} junction/symlink folder(s) {1}" -f $nLinks, $verb)
+}
+if ($nDirs -gt 0 -and $rows.Count -le ($nDirs + $nFiles) -and $errors.Count -gt 0) {
+    Write-Host "  NOTE: some folders could not be listed - see the errors file below"
+}
 Write-Host "  CSV: $Out"
 if ($errors.Count -gt 0) { Write-Host "  errors: $errPath" }
 Write-Host "  next: python qcimport.py `"$Out`""
