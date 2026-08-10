@@ -142,13 +142,15 @@ most common first failure:
 | account | flag |
 |---|---|
 | personal (@outlook / @hotmail / @live) | `--tenant consumers` |
-| work or school | `--tenant organizations`, or the exact domain / tenant GUID |
+| work or school | the **exact domain** (`--tenant pitt.edu`) or its tenant GUID |
 
-The default `common` often fails with **AADSTS50059** ("no tenant-identifying
-information"), because a device-code request is created *before* you sign in,
-so there is no username for Entra to infer a tenant from. The tool now
-translates that error — and the other common AADSTS codes — into the next thing
-to try.
+Device-code sign-in must be minted against **one concrete tenant**, and it
+happens *before* you authenticate, so Entra has no username to infer one from.
+That makes both `common` (the default) and `organizations` fail with
+**AADSTS50059** — they are ambiguous multi-tenant endpoints. `consumers` works
+because it resolves to the one fixed personal-account directory; for work or
+school, name the domain. The tool translates this and the other common AADSTS
+codes into the next thing to try.
 
 ### Registering your own app
 
@@ -157,8 +159,9 @@ not exist in the personal-account directory — error **AADSTS700016**), and for
 work tenants that have not consented to that client. Five minutes, no cost:
 
 1. Open the [Entra portal](https://entra.microsoft.com) → **App registrations**
-   → **New registration**. (Signing in with a personal Microsoft account
-   creates a free default directory for you.)
+   → **New registration**. **Sign in with the account whose OneDrive you want
+   to census** — registering inside that tenant avoids any cross-tenant consent
+   question. (A personal Microsoft account gets a free default directory.)
 2. **Name** it anything (e.g. `quickcensus`). **Supported account types**: pick
    *"Accounts in any organizational directory … and personal Microsoft
    accounts"* if you will census a personal OneDrive; work-only is fine

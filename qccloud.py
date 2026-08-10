@@ -54,17 +54,23 @@ def _signin_guidance(msg: str, tenant: str, client_id: str) -> str:
     """Translate an AADSTS error into the next thing to try."""
     m = msg or ""
     if "AADSTS50059" in m:
-        return ("What it means: Entra could not tell which tenant to sign you in to — the\n"
-                "'common' endpoint cannot infer one before you have signed in.\n"
-                "Try:  --tenant consumers        (personal @outlook/@hotmail/@live account)\n"
-                "      --tenant organizations    (work or school account)\n"
-                "      --tenant yourschool.edu   (or the tenant GUID) to name it exactly")
+        return ("What it means: device-code sign-in must be created against ONE concrete\n"
+                "tenant, and it happens before you sign in — so there is no username for\n"
+                "Entra to infer one from. Both 'common' and 'organizations' are ambiguous\n"
+                "multi-tenant endpoints and will always fail here.\n"
+                "Use:  --tenant consumers      personal @outlook/@hotmail/@live account\n"
+                "                              (this one IS concrete: the personal-account tenant)\n"
+                "      --tenant yourschool.edu work or school — the exact domain, or its\n"
+                "                              tenant GUID; nothing vaguer will resolve")
     if "AADSTS700016" in m:
         who = ("personal Microsoft accounts" if MSA_TENANT in m else f"tenant {tenant!r}")
         extra = ("\nThe default client (Microsoft Graph Command Line Tools) is not available to\n"
                  "personal Microsoft accounts, so a personal OneDrive always needs your own app."
                  if MSA_TENANT in m else
-                 "\nYour tenant has not installed/consented to this first-party client.")
+                 "\nGood news: the tenant itself resolved — only the client is missing. Your\n"
+                 "organisation has not installed this Microsoft first-party app. Register your\n"
+                 "own app WHILE SIGNED IN WITH THAT WORK ACCOUNT, so it lives inside the tenant\n"
+                 "and needs no cross-tenant approval (Files.Read is normally user-consentable).")
         return (f"What it means: client {client_id} does not exist for {who}.{extra}\n\n"
                 + REGISTER_APP)
     if "AADSTS7000218" in m or "client_assertion" in m or "client_secret" in m:
