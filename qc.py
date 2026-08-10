@@ -304,6 +304,27 @@ def human(n) -> str:
     return f"{n:.1f} TiB"
 
 
+def _make_modal(dlg, attempts: int = 12) -> None:
+    """Grab input for a dialog, safely across platforms.
+
+    X11 refuses a grab on a window that is not yet mapped ('grab failed: window not
+    viewable') and mapping is asynchronous under Linux window managers, so the grab
+    must be retried rather than issued once. Retries go through the event loop
+    (`after`), never `wait_visibility`, which blocks forever if a window never maps.
+    Modality is a nicety: after the attempts are spent the dialog simply stays
+    non-modal instead of crashing the callback.
+    """
+    try:
+        dlg.update_idletasks()
+        dlg.grab_set()
+    except Exception:
+        if attempts > 0:
+            try:
+                dlg.after(50, lambda: _make_modal(dlg, attempts - 1))
+            except Exception:
+                pass
+
+
 DEFAULT_SORT = "size:desc,type:asc,name:asc"
 SORT_KEYS = ("size", "type", "name")
 
@@ -480,8 +501,8 @@ def pick_drives_gui(drives: list[dict], explicit_db: str | None, auto_dir: str,
         dlg = tk.Toplevel(root)
         dlg.title("Limit census to folders")
         dlg.transient(root)
-        dlg.grab_set()
         dlg.geometry("560x520")
+        _make_modal(dlg)  # after mapping — see helper (X11 grabs fail on unviewable windows)
         tk.Label(dlg, anchor="w", padx=10, pady=6,
                  text="Click a folder to tick/untick it. A ticked folder includes its whole "
                       "subtree. Drive roots can't be ticked — an unlimited drive is the default.").pack(fill="x")
@@ -572,7 +593,9 @@ def pick_drives_gui(drives: list[dict], explicit_db: str | None, auto_dir: str,
         if limit_var.get():
             choose_btn.config(state="normal")
             if not scope_state["paths"]:
-                choose_folders()
+                # defer out of the checkbox callback: let the toggle finish drawing
+                # before a modal dialog takes the grab
+                root.after(50, choose_folders)
         else:
             choose_btn.config(state="disabled")
 
