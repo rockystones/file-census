@@ -43,15 +43,29 @@ TAG_SYMLINK = 0xA000000C      # also used to mark Linux symlinks (qcview renders
 TAG_MOUNTPOINT = 0xA0000003   # junction on Windows; foreign-filesystem mount point on Linux
 
 
+def is_unc(p: str) -> bool:
+    return IS_WIN and p.startswith("\\\\") and not p.startswith("\\\\?\\")
+
+
 def ext_path(p: str) -> str:
-    """Long-path-safe form on Windows; identity on Linux."""
+    """Long-path-safe form on Windows; identity on Linux.
+
+    UNC needs its own prefix: \\\\server\\share becomes \\\\?\\UNC\\server\\share,
+    not \\\\?\\\\\\server\\share (which is not a valid path)."""
     if IS_WIN and not p.startswith("\\\\?\\"):
+        if p.startswith("\\\\"):
+            return "\\\\?\\UNC" + p[1:]
         return "\\\\?\\" + p
     return p
 
 
 def unext(p: str) -> str:
-    return p[4:] if IS_WIN and p.startswith("\\\\?\\") else p
+    if IS_WIN:
+        if p.startswith("\\\\?\\UNC\\"):
+            return "\\" + p[7:]
+        if p.startswith("\\\\?\\"):
+            return p[4:]
+    return p
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -64,8 +78,10 @@ CREATE TABLE IF NOT EXISTS scan(
   volume_guid  TEXT,               -- Volume GUID path: per-machine stable across letter changes
   hw_product   TEXT,               -- physical device model (zero-access IOCTL / lsblk)
   hw_serial    TEXT,               -- physical device serial: survives reformat
-  platform     TEXT,               -- 'win' | 'posix' (separator + case semantics)
+  platform     TEXT,               -- 'win' | 'posix' | 'cloud' (separator + case semantics)
   scope        TEXT,               -- NULL = whole drive; else JSON list of selected folders
+  unc_path     TEXT,               -- UNC target for network drives: the stable identity
+                                   -- (drive letters differ per machine and per user)
   disk_total   INTEGER,
   disk_free    INTEGER,
   started_utc  TEXT NOT NULL,
@@ -143,6 +159,22 @@ if IS_WIN:
     def is_cloud_tag(tag: int | None) -> bool:
         return tag is not None and (tag & 0xFFFF0FFF) == 0x9000001A
 
+    _mpr = ctypes.WinDLL("mpr", use_last_error=True)
+    _mpr.WNetGetConnectionW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR,
+                                        ctypes.POINTER(wintypes.DWORD)]
+
+    def unc_of(drive: str) -> str | None:
+        """UNC target behind a mapped drive letter ('Z:' -> '\\\\server\\share').
+        This, not the letter, is a network share's stable identity: the same share
+        is a different letter on another machine or for another user."""
+        if is_unc(drive):
+            return drive.rstrip("\\")
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(len(buf))
+        if _mpr.WNetGetConnectionW(drive.rstrip("\\"), buf, ctypes.byref(size)) == 0:
+            return buf.value or None
+        return None
+
     def volume_guid_of(root: str) -> str | None:
         """Volume GUID path for a root like 'E:\\'. Unelevated; stable per machine
         across drive-letter changes (but assigned per Windows install)."""
@@ -154,8 +186,11 @@ if IS_WIN:
     def hardware_identity_of(drive: str) -> tuple[str | None, str | None]:
         """(product, serial) of the physical device, via IOCTL_STORAGE_QUERY_PROPERTY
         on a ZERO-ACCESS volume handle — zero access is what makes this work without
-        elevation. Survives reformatting; USB bridges sometimes report the enclosure."""
-        h = _k32.CreateFileW("\\\\.\\" + drive, 0, 0x3, None, 3, 0, None)
+        elevation. Survives reformatting; USB bridges sometimes report the enclosure.
+        Network shares have no local device, so they report nothing."""
+        if is_unc(drive):
+            return None, None
+        h = _k32.CreateFileW("\\\\.\\" + drive.rstrip("\\"), 0, 0x3, None, 3, 0, None)
         if h == _INVALID_HANDLE:
             return None, None
         try:
@@ -213,7 +248,8 @@ if IS_WIN:
                 except OSError:
                     pass
             out.append({"drive": drive, "type": dtype, "label": label, "fs": fs,
-                        "serial": serial, "total": total, "free": free})
+                        "serial": serial, "total": total, "free": free,
+                        "unc": unc_of(drive) if dtype == "remote" else None})
         return out
 
 else:
@@ -222,6 +258,9 @@ else:
 
     def is_cloud_tag(tag: int | None) -> bool:
         return False  # no OneDrive placeholder semantics on Linux
+
+    def unc_of(drive: str) -> str | None:
+        return None   # network mounts appear as ordinary mount points on Linux
 
     def _lsblk_map() -> dict:
         """mountpoint -> {uuid, partuuid, label, fstype, model, serial, rm}. Best-effort;
@@ -391,9 +430,13 @@ def pick_drives_gui(drives: list[dict], explicit_db: str | None, auto_dir: str,
 
     for d in drives:
         text = (f"{d['drive']}  {d['label'] or '(no label)'}   {d['fs'] or '?'}   "
-                f"{human(d['total'])} total, {human(d['free'])} free   [{d['type']}]")
+                f"{human(d['total'])} total, {human(d['free'])} free   [{d['type']}]"
+                + (f"   {d['unc']}" if d.get("unc") else "")
+                + ("   (network: slower — consider limiting to folders below)"
+                   if d["type"] == "remote" else ""))
         v = tk.BooleanVar(value=False)
-        state = "normal" if d["type"] in ("fixed", "removable", "ramdisk") else "disabled"
+        # network drives ARE selectable: they are latency-bound, not unsupported
+        state = "normal" if d["type"] in ("fixed", "removable", "ramdisk", "remote") else "disabled"
         tk.Checkbutton(root, text=text, variable=v, anchor="w", padx=16, state=state,
                        command=refresh_suggestion).pack(fill="x")
         vars_by_drive[d["drive"]] = v
@@ -672,8 +715,12 @@ def iso_now() -> str:
 
 
 def _drive_token(d: str) -> str:
-    """Filename-safe tag for a drive: 'E:' -> 'E'; '/mnt/data' -> 'mnt-data'; '/' -> 'root'."""
+    """Filename-safe tag: 'E:' -> 'E'; '\\\\srv\\share' -> 'srv-share';
+    '/mnt/data' -> 'mnt-data'; '/' -> 'root'."""
     if IS_WIN:
+        if is_unc(d):
+            tag = "".join(c if c.isalnum() else "-" for c in d.strip("\\"))
+            return "-".join(filter(None, tag.split("-"))) or "unc"
         return d[0].upper()
     tag = d.strip("/").replace("/", "-")
     return "".join(c if c.isalnum() or c == "-" else "_" for c in tag) or "root"
@@ -692,7 +739,7 @@ def open_db(path: str) -> sqlite3.Connection:
     con.executescript(SCHEMA)
     # migrate catalogs created before the identity columns existed
     cols = {r[1] for r in con.execute("PRAGMA table_info(scan)")}
-    for col in ("volume_guid", "hw_product", "hw_serial", "platform", "scope"):
+    for col in ("volume_guid", "hw_product", "hw_serial", "platform", "scope", "unc_path"):
         if col not in cols:
             con.execute(f"ALTER TABLE scan ADD COLUMN {col} TEXT")
     ecols = {r[1] for r in con.execute("PRAGMA table_info(entry)")}
@@ -711,6 +758,7 @@ def scan_drive(con: sqlite3.Connection, drive: str, skip_paths_cf: set[str],
     label, fs, serial = volume_info(root if IS_WIN else drive)
     guid = volume_guid_of(root if IS_WIN else drive)
     hw_product, hw_serial = hardware_identity_of(drive)
+    unc = unc_of(drive)
     try:
         usage = shutil.disk_usage(root)
         disk_total, disk_free = usage.total, usage.free
@@ -718,9 +766,10 @@ def scan_drive(con: sqlite3.Connection, drive: str, skip_paths_cf: set[str],
         disk_total = disk_free = None
     cur = con.execute(
         "INSERT INTO scan(drive, label, fs_type, serial_hex, volume_guid, hw_product, hw_serial, "
-        "platform, scope, disk_total, disk_free, started_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        "platform, scope, unc_path, disk_total, disk_free, started_utc) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (drive, label, fs, serial, guid, hw_product, hw_serial,
-         "win" if IS_WIN else "posix", json.dumps(scope) if scope else None,
+         "win" if IS_WIN else "posix", json.dumps(scope) if scope else None, unc,
          disk_total, disk_free, iso_now()))
     scan_id = cur.lastrowid
     con.commit()
@@ -963,6 +1012,9 @@ def write_summary(con: sqlite3.Connection, scan_ids: list[int], txt_path: str, t
         w(f"   identity: volume serial {s['serial_hex'] or '—'} (travels with the drive)"
           f" · volume GUID {s['volume_guid'] or '—'} (this machine)"
           f" · hardware {hw or '—'} (survives reformat)")
+        if s["unc_path"]:
+            w(f"   network share: {s['unc_path']} — this UNC path, not the drive letter, is "
+              f"what identifies this volume across machines and users")
         if s["scope"]:
             sel = json.loads(s["scope"])
             w(f"   scope: LIMITED census — {len(sel)} selected folder(s); totals and the "
@@ -1098,7 +1150,8 @@ common error: "tkinter is not installed, so the GUI can't open."
     if args.list:
         for d in infos:
             print(f"{d['drive']}  {d['label'] or '(no label)':<18} {d['fs'] or '?':<6} "
-                  f"{human(d['total']):>10} total  {human(d['free']):>10} free  [{d['type']}]")
+                  f"{human(d['total']):>10} total  {human(d['free']):>10} free  [{d['type']}]"
+                  + (f"  -> {d['unc']}" if d.get("unc") else ""))
         return 0
 
     scopes: dict[str, list[str]] = {}
@@ -1107,6 +1160,14 @@ common error: "tkinter is not installed, so the GUI can't open."
         if IS_WIN:
             valid = {d["drive"].upper() for d in infos}
             for raw in args.drives:
+                if is_unc(raw):  # \\server\share — no mapping needed, works elevated too
+                    d = raw.rstrip("\\/")
+                    if not os.path.isdir(ext_path(d)):
+                        print(f"{d} is not reachable (is the share mounted and are you "
+                              f"signed in?)", file=sys.stderr)
+                        return 2
+                    drives.append(d)
+                    continue
                 d = raw.rstrip(":\\/").upper() + ":"
                 if d not in valid:
                     print(f"drive {d} not present (detected: {', '.join(sorted(valid))})",

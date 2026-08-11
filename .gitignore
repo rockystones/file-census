@@ -1,5 +1,10 @@
+# Census OUTPUT is sensitive: every artifact below is a full listing of somebody's
+# filenames. This repo is public — nothing produced by these tools belongs in it.
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+*.csv
 census_*.txt
+qcexport_*.txt
+*.errors.txt
 __pycache__/

@@ -127,6 +127,39 @@ orders what is shown, and the section header records which sort was used.
 Each run adds a new `scan` row per drive — history accumulates in one catalog,
 so two scans of the same drive can be compared later.
 
+## Mapped network drives and UNC shares
+
+Organisation shares work like any other volume — scan them by drive letter or,
+better, by UNC path:
+
+```
+python qc.py Z: --only "Z:\Projects"
+python qc.py \\fileserver\dept --only \\fileserver\dept\Projects
+```
+
+No credentials are handled: qc runs as you and inherits whatever Explorer
+already authenticated. `--list` shows each mapped letter with the share behind
+it, and the picker lists network drives too (they are selectable, just flagged
+as slower).
+
+**Prefer the UNC form.** A drive letter is per-machine and per-user — the same
+share is `Z:` here and `S:` on a colleague's machine — so the catalog records
+the UNC target in `scan.unc_path` and the summary prints it as the identity
+line. UNC also works where a mapped letter does not: an elevated prompt or a
+scheduled task runs in a different logon session and cannot see your mappings.
+
+**Expect it to be slow, and scope it.** A network census is latency-bound, not
+bandwidth-bound: every directory listing is a server round-trip, so a tree that
+takes a minute locally can take hours over SMB. `--only` is the difference. If
+the share is hosted on a machine you can log into, running qc.py *there*
+against the local path is dramatically faster and captures real volume
+identity.
+
+**Check coverage afterwards.** If the network drops mid-scan, individual
+folders fail into `scan_error` while the scan still finishes as `done` — so a
+partial network census can look complete. Read the error count in the summary
+before trusting the totals.
+
 ## When qc.py can't read a tree: qcexport.ps1 + qcimport.py
 
 Sometimes the tree is readable by *you*, in a shell, on that machine — but not
