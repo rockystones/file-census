@@ -64,8 +64,21 @@ def read_rows(path: str) -> list[dict]:
         return list(rdr)
 
 
+def read_meta(csv_path: str) -> dict:
+    """Sidecar written by qcexport.ps1: which volume/share the listing came from."""
+    p = os.path.splitext(csv_path)[0] + ".meta.json"
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p, encoding="utf-8-sig") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"note: ignoring unreadable {os.path.basename(p)} ({e})", file=sys.stderr)
+        return {}
+
+
 def build(con, rows: list[dict], label: str | None, serial: str | None,
-          source: str) -> int:
+          source: str, unc: str | None = None, meta: dict | None = None) -> int:
     entries: dict[str, dict] = {}
     for r in rows:
         p = (r["FullName"] or "").rstrip("\\/")
@@ -84,10 +97,24 @@ def build(con, rows: list[dict], label: str | None, serial: str | None,
     if not entries:
         sys.exit("no rows to import")
 
-    drives = {os.path.splitdrive(p)[0].upper() for p in entries}
-    drive = sorted(drives)[0] or "?:"
+    # splitdrive yields 'C:' for local paths and '\\\\server\\share' for UNC ones
+    drives = {os.path.splitdrive(p)[0] for p in entries}
+    drive = sorted(drives, key=str.casefold)[0] or "?:"
     if len(drives) > 1:
         print(f"note: listing spans {sorted(drives)}; cataloguing under {drive}", file=sys.stderr)
+    if not drive.startswith("\\\\"):
+        drive = drive.upper()
+
+    # identity: CLI flags win, then the sidecar, then the path shape itself
+    roots_meta = (meta or {}).get("roots") or []
+    if not unc:
+        unc = next((r.get("unc") for r in roots_meta if r.get("unc")), None)
+    if not unc and drive.startswith("\\\\"):
+        unc = drive
+    if not label:
+        label = next((r.get("volumeLabel") for r in roots_meta if r.get("volumeLabel")), None)
+    if not serial:
+        serial = next((r.get("serial") for r in roots_meta if r.get("serial")), None)
 
     # scope = the topmost listed folders (those whose parent was not itself listed)
     lower = {p.casefold() for p in entries}
@@ -97,10 +124,11 @@ def build(con, rows: list[dict], label: str | None, serial: str | None,
         roots = sorted({os.path.dirname(p) for p in entries})[:1]
 
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    fs_type = next((r.get("fileSystem") for r in roots_meta if r.get("fileSystem")), None)
     cur = con.execute(
-        "INSERT INTO scan(drive, label, fs_type, serial_hex, platform, scope, started_utc) "
-        "VALUES(?,?,?,?,?,?,?)",
-        (drive, label, None, serial, "win", json.dumps(roots), now))
+        "INSERT INTO scan(drive, label, fs_type, serial_hex, platform, scope, unc_path, "
+        "started_utc) VALUES(?,?,?,?,?,?,?,?)",
+        (drive, label, fs_type, serial, "win", json.dumps(roots), unc, now))
     scan_id = cur.lastrowid
 
     next_id = (con.execute("SELECT COALESCE(MAX(entry_id), 0) FROM entry").fetchone()[0]) + 1
@@ -179,6 +207,8 @@ def build(con, rows: list[dict], label: str | None, serial: str | None,
     con.commit()
     print(f"  scan {scan_id}: {n_files:,} files, {n_dirs:,} folders, {human(n_bytes)}, "
           f"{n_err} unreadable path(s)")
+    if unc:
+        print(f"    network share: {unc} (recorded as this volume's identity)")
     for r in roots:
         print(f"    scope: {r}")
     return scan_id
@@ -194,17 +224,22 @@ def main(argv=None) -> int:
     p.add_argument("--label", default=None, help="volume label to record")
     p.add_argument("--serial", default=None, help="volume serial, if known (ties this listing "
                                                   "to scans of the same drive)")
+    p.add_argument("--unc", default=None, help=r"UNC share this listing came from, e.g. "
+                                               r"\\server\share (usually detected automatically "
+                                               "from the .meta.json sidecar or the paths)")
     p.add_argument("--top", type=int, default=100)
     p.add_argument("--sort", default=DEFAULT_SORT)
     args = p.parse_args(argv)
     sort_spec = parse_sort(args.sort)
 
     rows = read_rows(args.csv)
+    meta = read_meta(args.csv)
     db_path = os.path.abspath(args.db or (os.path.splitext(args.csv)[0] + ".sqlite"))
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     con = open_db(db_path)
     try:
-        scan_id = build(con, rows, args.label, args.serial, os.path.abspath(args.csv))
+        scan_id = build(con, rows, args.label, args.serial, os.path.abspath(args.csv),
+                        unc=args.unc, meta=meta)
         txt = os.path.splitext(db_path)[0] + ".txt"
         write_summary(con, [scan_id], txt, args.top, sort_spec)
         print(f"catalog: {db_path}\nsummary: {txt}")

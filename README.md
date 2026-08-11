@@ -189,10 +189,24 @@ it) while recording junctions/symlinks without following them. `-SkipCloud`
 and `-FollowLinks` override each behaviour. The run summary states how many of
 each it saw, so silent skipping is visible.
 
+It works on network shares too, by mapped letter or UNC:
+
+```
+powershell -ExecutionPolicy Bypass -File qcexport.ps1 -Path "\\fileserver\dept\Projects"
+powershell -ExecutionPolicy Bypass -File qcexport.ps1 -Path "Z:\Projects"
+```
+
+On a share it announces the network target, retries a folder listing that fails
+transiently (`-Retries`, default 2 — an unretried blip would otherwise become a
+silent gap), and writes a `.meta.json` sidecar recording which volume or share
+the listing came from: the UNC target, volume label, filesystem, and serial.
+A listing taken through `Z:` therefore still identifies its share, so it lines
+up with scans taken from another machine where the same share is `S:`.
+
 `qcimport.py` turns that CSV into an ordinary catalog — recorded as a **scoped
 scan** whose scope is the folder you listed, so a partial listing can never be
-mistaken for whole-drive coverage. Pass `--serial <volume serial>` to tie the
-listing to other scans of the same drive. The result opens in qcview and diffs
+mistaken for whole-drive coverage. It picks up the sidecar automatically;
+`--serial`, `--label` and `--unc` override it if you know better. The result opens in qcview and diffs
 scan-vs-scan like any other catalog. Verified end-to-end: an exported+imported
 tree matches a direct `qc.py --only` scan of the same folder exactly — same
 files, same sizes, same timestamps to the nanosecond.
