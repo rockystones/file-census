@@ -10,6 +10,9 @@ Safety model:
   The local filesystem is never touched, so hydration cannot occur by construction.
 - Hashes (quickXorHash) are computed by the service and stored per file — content-grade
   dupe detection with zero bytes read.
+- Scales: each page is compacted to ~300-byte records as it arrives and catalog rows
+  are flushed in batches, so even a ~700k-item drive crawls in a few hundred MB of
+  memory (holding raw Graph items for the whole crawl used to exhaust RAM).
 
 Usage:
   python qccloud.py                       # sign in, census /me/drive, auto-named catalog
@@ -28,6 +31,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import namedtuple
 from datetime import datetime, timezone
 
 from qc import human, open_db, require_supported_python, suggest_db_name, write_summary, parse_sort, DEFAULT_SORT
@@ -37,7 +41,9 @@ LOGIN = "https://login.microsoftonline.com"
 # Microsoft Graph Command Line Tools (first-party public client; documented, secretless).
 DEFAULT_CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dae7d5"
 SCOPE = "https://graph.microsoft.com/Files.Read"
-SELECT = "id,name,size,parentReference,file,folder,fileSystemInfo,root"
+# 'package' matters: OneNote notebooks are package items (containers with children,
+# but no folder facet) — without it their subtrees would be silently dropped.
+SELECT = "id,name,size,parentReference,file,folder,fileSystemInfo,root,package"
 
 
 MSA_TENANT = "9188040d-6c67-4c5b-b112-36a304b66dad"  # Microsoft's personal-account directory
@@ -210,15 +216,43 @@ def iso_to_ns(s: str | None) -> int | None:
         return None
 
 
-def crawl(provider, fetch=fetch_json) -> tuple[dict, list[dict], str | None]:
-    """(drive info, all items, deltaLink). fetch is injectable for tests."""
+# One raw Graph driveItem is ~2 KB of nested Python dicts; a 700k-item drive held
+# raw is gigabytes and killed a real crawl with MemoryError. Each page is therefore
+# compacted to these ~300-byte records the moment it arrives, and the raw page is
+# dropped — the whole crawl then stays a few hundred MB regardless of drive size.
+Item = namedtuple("Item", "gid pid name is_dir size mtime birth hash is_root")
+
+
+def compact_item(it: dict) -> Item:
+    fsi = it.get("fileSystemInfo") or {}
+    pid = (it.get("parentReference") or {}).get("id")
+    is_dir = "folder" in it or "package" in it  # packages: OneNote notebooks, containers
+    return Item(
+        sys.intern(it["id"]),                   # intern: child ids == parent ids, share them
+        sys.intern(pid) if pid else None,
+        it.get("name") or "?",
+        is_dir,
+        None if is_dir else (it.get("size") or 0),
+        iso_to_ns(fsi.get("lastModifiedDateTime")),
+        iso_to_ns(fsi.get("createdDateTime")),
+        None if is_dir else ((it.get("file") or {}).get("hashes") or {}).get("quickXorHash"),
+        "root" in it,
+    )
+
+
+def crawl(provider, fetch=fetch_json) -> tuple[dict, dict[str, Item], str | None]:
+    """(drive info, compacted items by id, deltaLink). fetch is injectable for tests.
+    Keyed by id because a delta enumeration may return the same item more than once —
+    per the Graph contract the LAST occurrence is the current state and wins."""
     drive = fetch(f"{GRAPH}/me/drive?$select=id,driveType,name,owner,quota", provider)
-    items: list[dict] = []
+    items: dict[str, Item] = {}
     url = f"{GRAPH}/me/drive/root/delta?$select={SELECT}&$top=999"
     delta_link = None
     while url:
         page = fetch(url, provider)
-        items.extend(page.get("value", []))
+        for raw in page.get("value", ()):
+            rec = compact_item(raw)
+            items[rec.gid] = rec
         print(f"\r  {len(items):,} items fetched", end="", flush=True)
         url = page.get("@odata.nextLink")
         delta_link = page.get("@odata.deltaLink", delta_link)
@@ -226,7 +260,7 @@ def crawl(provider, fetch=fetch_json) -> tuple[dict, list[dict], str | None]:
     return drive, items, delta_link
 
 
-def build_catalog(con, drive: dict, items: list[dict], delta_link: str | None) -> int:
+def build_catalog(con, drive: dict, items: dict[str, Item], delta_link: str | None) -> int:
     owner = (((drive.get("owner") or {}).get("user")) or {}).get("displayName") or "me"
     quota = drive.get("quota") or {}
     started = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -237,70 +271,73 @@ def build_catalog(con, drive: dict, items: list[dict], delta_link: str | None) -
          drive.get("id"), "cloud", quota.get("total"), quota.get("remaining"), started))
     scan_id = cur.lastrowid
 
-    root_gid = None
-    by_gid: dict[str, dict] = {}
-    for it in items:
-        by_gid[it["id"]] = it
-        if "root" in it:
-            root_gid = it["id"]
+    root_gid = next((it.gid for it in items.values() if it.is_root), None)
     if root_gid is None:
         sys.exit("delta feed had no root item — nothing catalogued")
 
-    next_id = (con.execute("SELECT COALESCE(MAX(entry_id), 0) FROM entry").fetchone()[0]) + 1
-    eid_of: dict[str, int] = {}
-    kids: dict[str, list[str]] = {}
-    for it in items:
-        pid = (it.get("parentReference") or {}).get("id")
-        if pid and it["id"] != root_gid:
-            kids.setdefault(pid, []).append(it["id"])
-    orphans = [g for g, it in by_gid.items()
-               if g != root_gid and (it.get("parentReference") or {}).get("id") not in by_gid]
+    # tree by ids: children grouped under their parent; anything whose parent is
+    # missing OR is not a container (a file can't be walked into) attaches under
+    # root instead of being silently lost
+    kids: dict[str, list[Item]] = {}
+    orphans: list[Item] = []
+    for it in items.values():
+        if it.gid == root_gid:
+            continue
+        parent = items.get(it.pid) if it.pid else None
+        if parent is not None and parent.is_dir:
+            kids.setdefault(it.pid, []).append(it)
+        else:
+            orphans.append(it)
     if orphans:
         print(f"  note: {len(orphans)} items with no reachable parent attached under root",
               file=sys.stderr)
         kids.setdefault(root_gid, []).extend(orphans)
 
-    batch = []
+    next_id = (con.execute("SELECT COALESCE(MAX(entry_id), 0) FROM entry").fetchone()[0]) + 1
+    total = len(items)
+    batch: list[tuple] = []
+
+    def flush():
+        nonlocal batch
+        if batch:
+            con.executemany(
+                "INSERT INTO entry(entry_id, scan_id, parent_id, name, is_dir, size_bytes, "
+                "mtime_ns, birth_ns, attr, reparse_tag, ext, depth, hash) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", batch)
+            batch = []
+            con.commit()
+            print(f"\r  cataloguing… {n_files + n_dirs:,}/{total:,}", end="", flush=True)
+
+    eid_of: dict[str, int] = {}  # containers only — files are never parents
     n_files = n_dirs = n_bytes = 0
     root_eid = next_id
     next_id += 1
     eid_of[root_gid] = root_eid
     batch.append((root_eid, scan_id, None, f"onedrive:{owner}", 1, None, None, None,
-                  0, None, None, 0))
+                  0, None, None, 0, None))
     stack = [(root_gid, 0)]
     while stack:
         gid, depth = stack.pop()
-        for cg in kids.get(gid, ()):
-            it = by_gid[cg]
-            fsi = it.get("fileSystemInfo") or {}
-            mtime = iso_to_ns(fsi.get("lastModifiedDateTime"))
-            birth = iso_to_ns(fsi.get("createdDateTime"))
+        peid = eid_of[gid]
+        for it in kids.get(gid, ()):
             eid = next_id
             next_id += 1
-            eid_of[cg] = eid
-            if "folder" in it:
-                batch.append((eid, scan_id, eid_of[gid], it.get("name") or "?", 1, None,
-                              mtime, birth, 0, None, None, depth + 1))
+            if it.is_dir:
+                batch.append((eid, scan_id, peid, it.name, 1, None,
+                              it.mtime, it.birth, 0, None, None, depth + 1, None))
                 n_dirs += 1
-                stack.append((cg, depth + 1))
+                eid_of[it.gid] = eid
+                stack.append((it.gid, depth + 1))
             else:
-                name = it.get("name") or "?"
-                ext = os.path.splitext(name)[1][1:].lower() or None
-                h = ((it.get("file") or {}).get("hashes") or {}).get("quickXorHash")
-                size = it.get("size") or 0
-                batch.append((eid, scan_id, eid_of[gid], name, 0, size,
-                              mtime, birth, 0, None, ext, depth + 1, h))
+                ext = os.path.splitext(it.name)[1][1:].lower() or None
+                batch.append((eid, scan_id, peid, it.name, 0, it.size,
+                              it.mtime, it.birth, 0, None, ext, depth + 1, it.hash))
                 n_files += 1
-                n_bytes += size
-    dirs_rows = [b for b in batch if len(b) == 12]
-    file_rows = [b for b in batch if len(b) == 13]
-    con.executemany(
-        "INSERT INTO entry(entry_id, scan_id, parent_id, name, is_dir, size_bytes, mtime_ns, "
-        "birth_ns, attr, reparse_tag, ext, depth) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", dirs_rows)
-    con.executemany(
-        "INSERT INTO entry(entry_id, scan_id, parent_id, name, is_dir, size_bytes, mtime_ns, "
-        "birth_ns, attr, reparse_tag, ext, depth, hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        file_rows)
+                n_bytes += it.size
+            if len(batch) >= 5000:
+                flush()
+    flush()
+    print(f"\r{' ' * 40}\r", end="")
     con.execute(
         "UPDATE scan SET finished_utc=?, dir_count=?, file_count=?, byte_total=?, "
         "error_count=0, status='done', scope=NULL WHERE scan_id=?",

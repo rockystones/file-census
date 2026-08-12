@@ -275,6 +275,14 @@ python qccloud.py --token-file %TEMP%\token.txt   # borrowed Graph Explorer toke
 how the token flows, how the delta crawl builds the catalog, and the audited
 safety model with its honest limits.
 
+Built for large drives: each Graph page is compacted to small records as it
+arrives and catalog rows are flushed in batches, so a ~700k-item drive crawls
+in roughly 350 MB of memory (regression-tested at that scale). Delta feeds that
+mention an item more than once keep the last occurrence, per the Graph
+contract; OneNote notebooks (`package` items) are catalogued as containers with
+their contents; items whose parent is missing from the feed attach under the
+drive root with a printed note.
+
 ### Choosing the tenant
 
 `--tenant` decides which sign-in authority is used, and getting it wrong is the

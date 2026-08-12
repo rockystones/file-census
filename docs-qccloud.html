@@ -186,15 +186,21 @@ credential, and it refuses any destination that is not Microsoft Graph.</figcapt
 retries the <em>same</em> URL — which is what lets a multi-hour crawl outlive its
 one-hour tokens without losing its place.</td></tr>
 <tr><td>crawl(provider)</td>
-<td>One <code>/me/drive</code> call, then the delta loop: accumulate every page's items,
-follow <code>nextLink</code>, stop at <code>deltaLink</code>. Returns (drive info, flat
-item list, resume cursor). Progress prints a running item count.</td></tr>
+<td>One <code>/me/drive</code> call, then the delta loop: follow <code>nextLink</code>,
+stop at <code>deltaLink</code>. Each page is <strong>compacted on arrival</strong> to a
+~300-byte record (id, parent, name, kind, size, times, hash) and the raw ~2 KB Graph
+dicts are dropped — holding them all was a real MemoryError at 691k items. Records are
+keyed by id, so a delta feed that mentions an item twice keeps the last occurrence, as
+the Graph contract specifies. Returns (drive info, records by id, resume cursor);
+progress prints a running count.</td></tr>
 <tr><td>build_catalog(con, drive, items, deltaLink)</td>
 <td>The flat feed arrives in arbitrary order, so the tree is built by identifiers, not
-sequence: index items by <code>id</code>, group children by
-<code>parentReference.id</code>, anchor on the one item carrying the <code>root</code>
-facet, then walk top-down assigning entry ids and depths. Items whose parent never
-appears (shared oddities) attach under the root with a printed note rather than being
+sequence: group children by parent id, anchor on the one item carrying the
+<code>root</code> facet, then walk top-down assigning entry ids and depths, flushing
+rows to SQLite every 5,000 (constant memory; a 700k-item build takes seconds). OneNote
+notebooks are <code>package</code> items — containers without a <code>folder</code>
+facet — and are walked like folders. Items whose parent never appears, or whose parent
+is not a container, attach under the root with a printed note rather than being
 dropped. Files carry size, timestamps (<code>fileSystemInfo</code> — the filesystem
 dates, not upload dates), extension, and the hash. The scan row records
 <code>platform='cloud'</code>, the drive id as the volume serial, owner as the drive
@@ -219,8 +225,8 @@ the same summary .txt every census gets. Default catalog name follows the
   <text x="306" y="56" text-anchor="middle" class="svgtxts">no downloadUrl in $select — ever</text>
   <path d="M404 44 L452 44" class="svgline" marker-end="url(#c2)"/>
   <rect x="454" y="20" width="136" height="48" class="svgbox"/>
-  <text x="522" y="40" text-anchor="middle" class="svgtxt">items += page</text>
-  <text x="522" y="56" text-anchor="middle" class="svgtxts">flat, any order</text>
+  <text x="522" y="40" text-anchor="middle" class="svgtxt">compact each page</text>
+  <text x="522" y="56" text-anchor="middle" class="svgtxts">~300 B/item, by id</text>
   <path d="M522 68 C 522 108, 306 108, 306 70" class="svgline" marker-end="url(#c2)"/>
   <text x="414" y="102" text-anchor="middle" class="svgtxts">@odata.nextLink (repeat until deltaLink)</text>
   <path d="M590 44 L640 44" class="svgline" marker-end="url(#c2)"/>
@@ -253,11 +259,12 @@ schema; the parting deltaLink makes the next census incremental.</figcaption>
 crawl:
     drive = GET /me/drive ($select: id, driveType, owner, quota)
     url = /me/drive/root/delta?$select=id,name,size,parentReference,
-                                       file,folder,fileSystemInfo,root&$top=999
+                                       file,folder,fileSystemInfo,root,package&$top=999
     while url:
         page = fetch(url)                     # see fetch below
-        items += page.value
-        url = page.nextLink                   # absent on the last page
+        for item in page.value:
+            items[item.id] = compact(item)    # ~300 B record; raw dict dropped;
+        url = page.nextLink                   #   duplicate ids: last occurrence wins
     deltaLink = page.deltaLink                # resume cursor for next time
 
 fetch(url):
@@ -267,11 +274,11 @@ fetch(url):
     on 401: provider.renew(); retry the SAME url once   # crawl resumes in place
 
 build_catalog:
-    index items by id;  children[parent id] += item;  root = the item with the root facet
-    walk top-down from root assigning entry ids and depths
-        folder -&gt; dir row (timestamps from fileSystemInfo)
+    children[parent id] += item;  root = the item with the root facet
+    walk top-down from root assigning entry ids and depths, flush rows every 5,000
+        folder or package -&gt; dir row (packages = OneNote notebooks, walked like folders)
         file   -&gt; file row + size + ext + quickXorHash into entry.hash
-        parent never seen -&gt; attach under root, print a note
+        parent never seen, or parent is a file -&gt; attach under root, print a note
     scan row: drive='onedrive:&lt;owner&gt;', platform='cloud',
               serial = drive id, disk totals = quota
     store deltaLink in cloud_state;  write the standard summary .txt
