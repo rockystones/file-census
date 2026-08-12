@@ -3,8 +3,14 @@
 
 What it records: names, folder structure (parent/child tree), sizes, modified +
 created timestamps, attributes, extensions — everything directory enumeration
-provides. It NEVER opens a file: no content reads, no hashing, no per-file
-handles (os.scandir stat data comes from the directory listing itself).
+provides. By default it NEVER opens a file: no content reads, no hashing, no
+per-file handles (os.scandir stat data comes from the directory listing itself).
+
+Opt-in content hashing: --hash additionally opens each regular file READ-ONLY
+and computes its quickXorHash — the same content hash OneDrive reports through
+the Graph API — so catalogs of different drives (and qccloud.py cloud catalogs)
+can be joined by content, not just by name and size. Cloud placeholders,
+offline files and links are never opened, so nothing is hydrated.
 
 Write access: none to the scanned drives. The only thing written is the catalog
 database, and the tool refuses to place it on a drive being scanned unless you
@@ -15,6 +21,7 @@ Usage:
   qc.py C: E:                scan these drives (no popup)
   qc.py --list               show detected drives and exit
   qc.py E: --db PATH.sqlite  put the catalog somewhere specific
+  qc.py E: --hash            also hash file contents (reads every byte: slower)
 
 Windows + Linux, Python 3.11+ standard library only. On Windows, drives are letters and
 identity comes from Win32 volume/device queries; on Linux, "drives" are block-device
@@ -23,6 +30,7 @@ mount points and identity comes from lsblk (fs UUID / PARTUUID / model+serial).
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import shutil
@@ -66,6 +74,77 @@ def unext(p: str) -> str:
         if p.startswith("\\\\?\\"):
             return p[4:]
     return p
+
+
+# --- quickXorHash: the content hash OneDrive computes server-side ---
+# (Graph API: file.hashes.quickXorHash). Hashing local files with the same
+# algorithm makes local catalogs joinable with qccloud.py cloud catalogs.
+#
+# The algorithm (equivalent to Microsoft's reference implementation): a 160-bit
+# little-endian accumulator; stream byte i is XORed in at bit (11*i) mod 160,
+# bits shifted past 160 wrapping around to bit 0; finally the 8-byte
+# little-endian stream length is XORed into digest bytes 12..19 and the
+# 20 bytes are base64-encoded. Since 11*160 ≡ 0 (mod 160), bytes 160 apart in
+# the stream share a shift — so whole 160-byte groups can be XOR-folded
+# together first (fast big-int ops) and shifted once at the end.
+
+QXH_EMPTY = "AAAAAAAAAAAAAAAAAAAAAAAAAAA="  # hash of a zero-byte file
+
+
+def _qxh_fold(x: int, nbits: int) -> int:
+    """XOR-fold the little-endian int image of 160-byte-aligned data to 1280 bits."""
+    while nbits > 1280:
+        half = ((nbits // 2 + 1279) // 1280) * 1280  # split on a group boundary
+        x = (x >> half) ^ (x & ((1 << half) - 1))
+        nbits = half
+    return x
+
+
+def quickxorhash_stream(f, on_bytes=None, bufsize: int = 160 * 65536) -> str:
+    """quickXorHash of a binary stream. bufsize must be a multiple of 160 so
+    every chunk starts on a group boundary; on_bytes(n) is called per chunk so
+    multi-GiB files can drive a progress display."""
+    groups = 0
+    length = 0
+    while True:
+        chunk = f.read(bufsize)
+        if not chunk:
+            break
+        length += len(chunk)
+        if on_bytes:
+            on_bytes(len(chunk))
+        if len(chunk) % 160:
+            chunk += b"\0" * (160 - len(chunk) % 160)  # zero bytes XOR in as nothing
+        groups ^= _qxh_fold(int.from_bytes(chunk, "little"), len(chunk) * 8)
+    acc = 0
+    mask = (1 << 160) - 1
+    for j in range(160):
+        b = (groups >> (8 * j)) & 0xFF
+        if b:
+            v = b << (11 * j % 160)
+            acc ^= (v & mask) | (v >> 160)
+    digest = bytearray(acc.to_bytes(20, "little"))
+    for i, lb in enumerate(length.to_bytes(8, "little")):
+        digest[12 + i] ^= lb
+    return base64.b64encode(bytes(digest)).decode("ascii")
+
+
+# Never open these for hashing: OFFLINE/RECALL_* mark cloud placeholders where a
+# content read would make the sync client download ("hydrate") the file; a
+# reparse-tagged file is a link, not the content itself.
+FILE_ATTRIBUTE_OFFLINE = 0x1000
+FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x40000
+FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000
+_NO_HASH_ATTRS = (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN
+                  | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def hash_safe(attr: int) -> bool:
+    """May this file's content be read without side effects? attr is entry.attr."""
+    if IS_WIN:
+        return not (attr & _NO_HASH_ATTRS)
+    return statmod.S_ISREG(attr)  # skip sockets/FIFOs/devices/links
+
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -409,7 +488,8 @@ def pick_drives_gui(drives: list[dict], explicit_db: str | None, auto_dir: str,
     root = tk.Tk()
     root.title("quick census — select drives (read-only scan)")
     root.attributes("-topmost", True)
-    tk.Label(root, text="Metadata-only census. Nothing on the selected drives is written or opened.",
+    tk.Label(root, text="Metadata census. Nothing on the selected drives is written; no file is "
+                        "opened unless content hashing is ticked below.",
              anchor="w", padx=12, pady=8).pack(fill="x")
     vars_by_drive: dict[str, tk.BooleanVar] = {}
 
@@ -520,6 +600,12 @@ def pick_drives_gui(drives: list[dict], explicit_db: str | None, auto_dir: str,
                    variable=cloud_var, anchor="w", padx=16, command=cloud_toggled,
                    state="normal" if IS_WIN else "disabled").pack(fill="x", pady=(2, 0))
     cloud_hint.pack(fill="x")
+
+    hash_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(root, text="Compute content hashes (quickXorHash, what OneDrive reports) — "
+                              "opens every file read-only and reads all bytes: much slower; "
+                              "enables dedup across catalogs; placeholders are never downloaded",
+                   variable=hash_var, anchor="w", padx=16).pack(fill="x", pady=(2, 0))
 
     # --- limit the census to selected folders (default: whole drive) ---
     limit_var = tk.BooleanVar(value=False)
@@ -651,7 +737,8 @@ def pick_drives_gui(drives: list[dict], explicit_db: str | None, auto_dir: str,
     scope_label.pack(side="left", padx=6)
 
     picked: list[str] = []
-    result = {"db": "", "allow": False, "sort": default_sort, "cloud": False, "scopes": {}}
+    result = {"db": "", "allow": False, "sort": default_sort, "cloud": False, "scopes": {},
+              "hash": False}
 
     def _db_on_scanned(dbp: str, sel: list[str]) -> bool:
         if IS_WIN:
@@ -696,6 +783,7 @@ def pick_drives_gui(drives: list[dict], explicit_db: str | None, auto_dir: str,
         result["db"] = dbp
         result["allow"] = allow_var.get()
         result["cloud"] = cloud_var.get()
+        result["hash"] = hash_var.get()
         result["scopes"] = scopes
         result["sort"] = ",".join(f"{kv.get()}:{dv.get()}" for kv, dv in slot_vars
                                   if kv.get() != "—") or DEFAULT_SORT
@@ -707,7 +795,7 @@ def pick_drives_gui(drives: list[dict], explicit_db: str | None, auto_dir: str,
     tk.Button(row, text="Cancel", width=12, command=root.destroy).pack(side="left", padx=6)
     root.mainloop()
     return (picked, result["db"], result["allow"], result["sort"], result["cloud"],
-            result["scopes"])
+            result["scopes"], result["hash"])
 
 
 def iso_now() -> str:
@@ -750,7 +838,8 @@ def open_db(path: str) -> sqlite3.Connection:
 
 
 def scan_drive(con: sqlite3.Connection, drive: str, skip_paths_cf: set[str],
-               include_cloud: bool = False, scope: list[str] | None = None) -> int:
+               include_cloud: bool = False, scope: list[str] | None = None,
+               do_hash: bool = False) -> int:
     if IS_WIN:
         root = drive + "\\"
     else:
@@ -778,6 +867,7 @@ def scan_drive(con: sqlite3.Connection, drive: str, skip_paths_cf: set[str],
     batch: list[tuple] = []
     err_batch: list[tuple] = []
     n_dirs = n_files = n_bytes = n_errs = 0
+    n_hashed = n_hash_skip = n_hash_err = hash_bytes = 0
     t0 = time.monotonic()
     last_progress = 0.0
 
@@ -786,8 +876,8 @@ def scan_drive(con: sqlite3.Connection, drive: str, skip_paths_cf: set[str],
         if batch:
             con.executemany(
                 "INSERT INTO entry(entry_id, scan_id, parent_id, name, is_dir, size_bytes, "
-                "mtime_ns, birth_ns, attr, reparse_tag, ext, depth) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", batch)
+                "mtime_ns, birth_ns, attr, reparse_tag, ext, depth, hash) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", batch)
             batch = []
         if err_batch:
             con.executemany("INSERT INTO scan_error(scan_id, path, error) VALUES(?,?,?)", err_batch)
@@ -801,13 +891,38 @@ def scan_drive(con: sqlite3.Connection, drive: str, skip_paths_cf: set[str],
             return
         last_progress = now
         shown = current if len(current) <= 58 else "…" + current[-57:]
-        print(f"\r{drive} {n_files:,} files, {n_dirs:,} dirs, {human(n_bytes)}"
+        hashed = f", hashed {human(hash_bytes)}" if do_hash else ""
+        print(f"\r{drive} {n_files:,} files, {n_dirs:,} dirs, {human(n_bytes)}{hashed}"
               f" | {shown:<58}", end="", flush=True)
+
+    def hash_file(path: str, size: int) -> str | None:
+        """quickXorHash of one file, or None (recorded in scan_error) if unreadable.
+        Callers must have checked hash_safe() first — this does open the file."""
+        nonlocal n_hashed, n_hash_err, hash_bytes
+        disp = unext(path)
+
+        def bump(n: int):  # keeps the progress line moving inside multi-GiB files
+            nonlocal hash_bytes
+            hash_bytes += n
+            progress(disp)
+
+        try:
+            if size == 0:
+                h = QXH_EMPTY  # nothing to read; skip the open entirely
+            else:
+                with open(path, "rb") as fh:
+                    h = quickxorhash_stream(fh, on_bytes=bump)
+            n_hashed += 1
+            return h
+        except OSError as e:
+            err_batch.append((scan_id, disp, f"hash: {type(e).__name__}: {e.strerror or e}"))
+            n_hash_err += 1
+            return None
 
     root_id = next_id
     next_id += 1
     batch.append((root_id, scan_id, None, drive, 1, None, None, None,
-                  FILE_ATTRIBUTE_DIRECTORY if IS_WIN else 0o040000, None, None, 0))
+                  FILE_ATTRIBUTE_DIRECTORY if IS_WIN else 0o040000, None, None, 0, None))
     root_dev = None
     if not IS_WIN:
         try:
@@ -847,7 +962,7 @@ def scan_drive(con: sqlite3.Connection, drive: str, skip_paths_cf: set[str],
                 attr = st.st_file_attributes if IS_WIN else st.st_mode
                 birth = getattr(st, "st_birthtime_ns", None) or st.st_ctime_ns
                 batch.append((eid, scan_id, parent, c, 1, None, st.st_mtime_ns, birth,
-                              attr, None, None, depth))
+                              attr, None, None, depth, None))
                 n_dirs += 1
                 cache[key] = eid
                 parent = eid
@@ -902,7 +1017,7 @@ def scan_drive(con: sqlite3.Connection, drive: str, skip_paths_cf: set[str],
                     next_id += 1
                     if is_dir:
                         batch.append((eid, scan_id, parent_id, entry.name, 1, None,
-                                      st.st_mtime_ns, birth, attr, tag, None, depth))
+                                      st.st_mtime_ns, birth, attr, tag, None, depth, None))
                         n_dirs += 1
                         if descend:
                             stack.append((entry.path, eid, depth + 1))
@@ -911,8 +1026,14 @@ def scan_drive(con: sqlite3.Connection, drive: str, skip_paths_cf: set[str],
                             next_id -= 1
                             continue  # the live catalog db itself
                         ext = os.path.splitext(entry.name)[1][1:].lower() or None
+                        h = None
+                        if do_hash:
+                            if hash_safe(attr):
+                                h = hash_file(entry.path, st.st_size)
+                            else:
+                                n_hash_skip += 1
                         batch.append((eid, scan_id, parent_id, entry.name, 0, st.st_size,
-                                      st.st_mtime_ns, birth, attr, tag, ext, depth))
+                                      st.st_mtime_ns, birth, attr, tag, ext, depth, h))
                         n_files += 1
                         n_bytes += st.st_size
                     if len(batch) >= 5000:
@@ -929,6 +1050,9 @@ def scan_drive(con: sqlite3.Connection, drive: str, skip_paths_cf: set[str],
     elapsed = time.monotonic() - t0
     print(f"\r{drive} scan {scan_id}: {n_files:,} files, {n_dirs:,} dirs, {human(n_bytes)}, "
           f"{n_errs} errors, {elapsed:.1f}s ({status}){' ' * 40}")
+    if do_hash:
+        print(f"    hashed {n_hashed:,} files ({human(hash_bytes)} read); "
+              f"{n_hash_skip:,} skipped (placeholder/offline/link), {n_hash_err} unreadable")
     top = con.execute(
         "SELECT COALESCE(ext,'(none)') e, COUNT(*) n, SUM(size_bytes) b FROM entry "
         "WHERE scan_id=? AND is_dir=0 GROUP BY ext ORDER BY b DESC LIMIT 10", (scan_id,)).fetchall()
@@ -992,7 +1116,12 @@ def write_summary(con: sqlite3.Connection, scan_ids: list[int], txt_path: str, t
     out = []
     w = out.append
     w("QUICK CENSUS SUMMARY")
-    w(f"generated {datetime.now().strftime('%Y-%m-%d %H:%M')} by qc.py — metadata only, no file was opened")
+    hashed_any = any(con.execute(
+        "SELECT 1 FROM entry WHERE scan_id=? AND hash IS NOT NULL LIMIT 1", (sid,)).fetchone()
+        for sid in scan_ids)
+    w(f"generated {datetime.now().strftime('%Y-%m-%d %H:%M')} by qc.py — "
+      + ("file contents were read (read-only) to compute quickXorHash" if hashed_any
+         else "metadata only, no file was opened"))
     for scan_id in scan_ids:
         s = con.execute("SELECT * FROM scan WHERE scan_id=?", (scan_id,)).fetchone()
         elapsed = ""
@@ -1015,6 +1144,12 @@ def write_summary(con: sqlite3.Connection, scan_ids: list[int], txt_path: str, t
         w(f"   identity: volume serial {s['serial_hex'] or '—'} (travels with the drive)"
           f" · volume GUID {s['volume_guid'] or '—'} (this machine)"
           f" · hardware {hw or '—'} (survives reformat)")
+        hr = con.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(size_bytes),0) b FROM entry "
+            "WHERE scan_id=? AND is_dir=0 AND hash IS NOT NULL", (scan_id,)).fetchone()
+        if hr["n"]:
+            w(f"   content hashes (quickXorHash): {hr['n']:,} of {s['file_count']:,} files "
+              f"({human(hr['b'])}) — joinable with other hashed catalogs on entry.hash")
         if s["unc_path"]:
             w(f"   network share: {s['unc_path']} — this UNC path, not the drive letter, is "
               f"what identifies this volume across machines and users")
@@ -1140,6 +1275,10 @@ common error: "tkinter is not installed, so the GUI can't open."
     p.add_argument("--include-cloud", action="store_true",
                    help="descend into cloud placeholder dirs (OneDrive online-only): metadata-only, "
                         "never downloads content; may make the sync client materialize child stubs")
+    p.add_argument("--hash", action="store_true",
+                   help="also compute each file's quickXorHash (the content hash OneDrive reports) "
+                        "by reading it — read-only but slow (every byte is read); cloud "
+                        "placeholders, offline files and links are skipped, never downloaded")
     p.add_argument("--only", action="append", default=[], metavar="FOLDER",
                    help="limit the census to this folder (repeatable; absolute path on a "
                         "scanned drive; default = whole drive)")
@@ -1188,7 +1327,7 @@ common error: "tkinter is not installed, so the GUI can't open."
                     return 2
                 drives.append(d)
     else:
-        drives, gui_db, gui_allow, gui_sort, gui_cloud, scopes = pick_drives_gui(
+        drives, gui_db, gui_allow, gui_sort, gui_cloud, scopes, gui_hash = pick_drives_gui(
             infos, args.db, script_dir, args.sort)
         if not drives:
             print("nothing selected")
@@ -1196,6 +1335,7 @@ common error: "tkinter is not installed, so the GUI can't open."
         args.db = gui_db
         args.allow_db_on_scanned = args.allow_db_on_scanned or gui_allow
         args.include_cloud = args.include_cloud or gui_cloud
+        args.hash = args.hash or gui_hash
         sort_spec = parse_sort(gui_sort)
 
     for raw in args.only:
@@ -1238,7 +1378,7 @@ common error: "tkinter is not installed, so the GUI can't open."
     try:
         for d in drives:
             scan_ids.append(scan_drive(con, d, skip, include_cloud=args.include_cloud,
-                                       scope=scopes.get(d)))
+                                       scope=scopes.get(d), do_hash=args.hash))
     except KeyboardInterrupt:
         print("\naborted by user — completed drives are intact, current scan marked 'aborted'",
               file=sys.stderr)

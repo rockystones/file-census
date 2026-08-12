@@ -8,21 +8,28 @@ serial, PARTUUID → volume GUID, device model+serial → hardware). Linux scans
 never follow symlinks and never cross into other filesystems (foreign mount
 points are recorded like junctions); case sensitivity is respected per
 platform. Walks entire drives and
-records what directory enumeration alone provides — **no file is ever opened**:
+records what directory enumeration alone provides — **by default, no file is
+ever opened**:
 
 - names + full folder structure (parent/child tree)
 - sizes, modified + created timestamps
 - attribute bits, reparse tags (junctions/symlinks recorded, never followed)
 - extension, depth
+- optionally (`--hash`, off by default) each file's **quickXorHash** — the
+  content hash OneDrive itself reports — computed by reading the file
+  read-only; see *Content hashing* below
 
 Intended for non-sensitive drives where filenames are not a privacy concern.
 
 ## Safety & privacy model
 
-**Safety of the scanned drives is structural, not promised.** The tool contains
-no code path that opens a file: metadata comes from directory listings
-(`os.scandir`), so nothing can be modified, locked, executed, or hydrated by a
-scan, and locked files cannot block it. The only artifact written anywhere is
+**Safety of the scanned drives is structural, not promised.** In its default
+mode the tool contains no code path that opens a file: metadata comes from
+directory listings (`os.scandir`), so nothing can be modified, locked,
+executed, or hydrated by a scan, and locked files cannot block it. Opting into
+`--hash` adds exactly one new operation — `open(path, "rb")` and sequential
+reads — and applies it only to files whose attributes prove it side-effect
+free (see *Content hashing*). The only artifact written anywhere is
 the catalog + summary pair, and qc.py refuses to place them on a drive being
 scanned unless you pass `--allow-db-on-scanned` (the catalog file is then
 excluded from its own census). There are zero network calls — standard library
@@ -126,6 +133,52 @@ orders what is shown, and the section header records which sort was used.
 
 Each run adds a new `scan` row per drive — history accumulates in one catalog,
 so two scans of the same drive can be compared later.
+
+## Content hashing: `--hash`
+
+```
+python qc.py E: --hash          # census + quickXorHash of every file's content
+```
+
+Off by default (and a separate checkbox in the GUI). When on, the census opens
+each regular file **read-only** and computes its **quickXorHash** — the same
+content hash Microsoft's servers compute for every OneDrive file and report
+through the Graph API (`file.hashes.quickXorHash`). The hash lands in the
+`entry.hash` column that `qccloud.py` fills for cloud catalogs, which is the
+point: catalogs become joinable **by content**, across drives and against the
+cloud —
+
+```sql
+-- which files on this backup drive already live in OneDrive, byte-identical?
+SELECT l.path, c.path AS onedrive_path
+FROM   local.v_paths l JOIN cloud.v_paths c
+       ON l.hash = c.hash AND l.is_dir = 0 AND c.is_dir = 0;
+```
+
+Same-size files with different content, renamed copies, and moved trees all
+resolve correctly — name/size dedup can only *suggest*, hash dedup *proves*
+(up to hash collision, which quickXorHash being non-cryptographic makes
+possible but which does not occur by accident in practice; treat matches on
+this hash as "same file" for dedup triage, and re-verify byte-for-byte before
+anything destructive).
+
+**What is never hashed** (recorded as skipped, hash stays NULL): cloud
+placeholders and offline files (`FILE_ATTRIBUTE_OFFLINE`, `RECALL_ON_OPEN`,
+`RECALL_ON_DATA_ACCESS` — opening those would make the sync client download
+content, the one thing this tool must never cause), reparse-tagged files
+(links), and on Linux anything that is not a regular file. Unreadable files
+are logged to `scan_error` with a `hash:` prefix and the walk continues.
+Zero-byte files get their constant hash (`AAAAAAAAAAAAAAAAAAAAAAAAAAA=`)
+without being opened.
+
+**Cost:** every byte of the drive is read once, so a hashing census runs at
+disk speed instead of enumeration speed — hours for terabytes, not seconds.
+The implementation (stdlib-only, big-int XOR folding) sustains several hundred
+MiB/s, so a spinning disk or USB enclosure is the bottleneck, not Python. The
+progress line shows bytes hashed live, including inside multi-GiB files.
+Correctness is pinned by published Microsoft/rclone test vectors and a
+cross-check against an independent transcription of Microsoft's reference
+implementation.
 
 ## Mapped network drives and UNC shares
 

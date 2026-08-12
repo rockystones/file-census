@@ -50,8 +50,8 @@ figcaption { color: var(--dim); font-size: 13px; margin-top: 6px; }
 
 <h1>qc.py — quick drive census, explained</h1>
 <p class="sub">One Python file (standard library only, Windows + Linux) that walks entire
-drives and stores every file and folder's metadata in a SQLite database — without ever
-opening a file. On Linux, "drives" are block-device mount points, identity comes from
+drives and stores every file and folder's metadata in a SQLite database — by default without
+ever opening a file (opt-in <code>--hash</code> adds read-only content hashing). On Linux, "drives" are block-device mount points, identity comes from
 <code>lsblk</code> (fs UUID / PARTUUID / model+serial), symlinks map to the symlink reparse
 tag and foreign mount points to the junction tag, and scans stay on one filesystem. A census
 can also be <strong>scoped</strong> to selected folders (GUI folder-tree picker or repeatable
@@ -69,7 +69,8 @@ document explains what it calls, what it defines, and how the pieces run togethe
 operating system returns each child's metadata <em>as part of the directory listing itself</em>,
 so the follow-up <code>entry.stat(follow_symlinks=False)</code> is free — no extra system call,
 and crucially <strong>no file handle is ever opened</strong>. That is the source of the tool's
-"read-only, can't touch, can't block" guarantee.</td></tr>
+"read-only, can't touch, can't block" guarantee. (The one opt-in exception: <code>--hash</code>
+opens files read-only to compute content hashes — see the quickXorHash row below.)</td></tr>
 <tr><td>stat fields</td>
 <td>From each entry qc.py reads: <code>st_size</code>, <code>st_mtime_ns</code> (modified) and
 <code>st_birthtime_ns</code> (created) as integer nanoseconds, <code>st_file_attributes</code>
@@ -127,6 +128,20 @@ variants). Junctions and symlinks are never descended; cloud placeholder <em>fol
 are descended only when the user opts in (<code>--include-cloud</code> / GUI checkbox,
 default off) — enumeration is metadata-only and can never download file content, though it
 may make the sync client materialize child placeholder stubs.</td></tr>
+<tr><td>quickxorhash_stream(f) / hash_safe(attr)</td>
+<td>Opt-in content hashing (<code>--hash</code> / GUI checkbox, default off).
+<code>quickxorhash_stream</code> computes <strong>quickXorHash</strong> — the content hash
+OneDrive's servers report via the Graph API — by streaming a file in 10&nbsp;MiB chunks and
+XOR-folding them as big integers (each stream byte lands at bit <code>11·i mod 160</code> of a
+160-bit accumulator; the file length is XORed into the tail; base64 of the 20 bytes). Several
+hundred MiB/s in pure stdlib, so disks, not Python, set the pace. <code>hash_safe</code> is the
+gate consulted <em>before any open</em>: cloud placeholders / offline files
+(<code>FILE_ATTRIBUTE_OFFLINE</code>, <code>RECALL_ON_OPEN</code>,
+<code>RECALL_ON_DATA_ACCESS</code>) and reparse-tagged files are never opened — reading a
+placeholder would make the sync client download it, the one side effect this tool must never
+cause. Hashes land in <code>entry.hash</code>, the same column qccloud.py fills, so local and
+cloud catalogs join by content. Validated against published Microsoft/rclone test vectors and
+an independent transcription of Microsoft's reference implementation.</td></tr>
 <tr><td>pick_drives_gui(drives, explicit_db, auto_dir)</td>
 <td>Builds the dialog and blocks until the user acts. Returns a 3-tuple:
 the ticked drive letters, the catalog file path, and whether "allow catalog on a scanned
@@ -301,7 +316,9 @@ start/finish times, final counts, status. The catalog accumulates history — re
 same drive are new rows, enabling later comparison.</td></tr>
 <tr><td>entry</td><td>One row per file or folder: <code>parent_id</code> (the tree),
 <code>name</code>, <code>is_dir</code>, <code>size_bytes</code>, modified/created times
-(integer nanoseconds), attribute bits, reparse tag, extension, depth. Full paths are
+(integer nanoseconds), attribute bits, reparse tag, extension, depth — plus <code>hash</code>,
+the quickXorHash of the file's content, filled by <code>--hash</code> locally or by qccloud.py
+from the Graph API (NULL otherwise). Full paths are
 deliberately <em>not</em> stored — storing each name once against a parent pointer kept a
 642,000-row catalog at 73 MiB.</td></tr>
 <tr><td>scan_error</td><td>Directories/files that could not be listed (typically
@@ -355,7 +372,10 @@ scan_drive(con, drive, skip):
                    or (opted-in and cloud placeholder tag):   # OneDrive online-only dirs
                     stack.push(child, id, depth+1)    #   metadata-only; no cycles
             else if child not in skip:
-                append row (id, parent_id, name, size, times, attr, ext, depth)
+                hash = NULL
+                if --hash and hash_safe(attr):        # placeholders/links: never opened
+                    hash = quickxorhash_stream(open(child, read-only))
+                append row (id, parent_id, name, size, times, attr, ext, depth, hash)
             if 5000 rows pending: write them, commit  # executemany batch
 
         update progress line (throttled to 4/sec)
@@ -368,10 +388,12 @@ scan_drive(con, drive, skip):
 <div class="note">
 <strong>Why it's fast and safe, in one breath:</strong> the directory listing already
 contains every fact qc.py wants, so the tool is one long sequence of "list folder, remember
-children, push subfolders" — no file opens (nothing can be locked, modified, triggered, or
-cloud-hydrated), no recursion (no depth limits), ids pre-assigned (everything batches),
-junctions never entered (no infinite loops), failures logged instead of fatal.
-550,000 files → 68 seconds → one 73 MiB SQLite file you can query with plain SQL.</div>
+children, push subfolders" — no file opens by default (nothing can be locked, modified,
+triggered, or cloud-hydrated), no recursion (no depth limits), ids pre-assigned (everything
+batches), junctions never entered (no infinite loops), failures logged instead of fatal.
+550,000 files → 68 seconds → one 73 MiB SQLite file you can query with plain SQL. With
+<code>--hash</code> the same walk additionally reads each safe-to-open file once, read-only,
+and the census runs at disk speed instead — that is the entire difference.</div>
 
 <div class="note">
 <strong>Privacy model:</strong> the catalog itself lists every filename on a drive — treat
@@ -383,7 +405,7 @@ location (e.g. <code>%LOCALAPPDATA%\quickcensus</code>) when the cloud opt-in is
 Full reasoning in README.md.</div>
 
 <p class="sub">Companion file: README.md (usage, guarantees, ready-made SQL queries).
-Generated 2026-07-30 for qc.py v1.1.</p>
+Generated 2026-07-30 for qc.py v1.1; content-hashing section added 2026-08-12 (v1.2).</p>
 
 </main>
 </body>
