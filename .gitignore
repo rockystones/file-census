@@ -1,3 +1,6 @@
+# Bearer tokens must never enter the repo (short-lived, but still credentials)
+token.txt
+*.token
 # Census OUTPUT is sensitive: every artifact below is a full listing of somebody's
 # filenames. This repo is public — nothing produced by these tools belongs in it.
 *.sqlite

@@ -109,6 +109,43 @@ def _post_form(url: str, data: dict) -> dict:
         return json.loads(e.read())
 
 
+class TokenProvider:
+    """Holds the current bearer token in memory; renew() fetches a fresh one when a
+    request comes back 401 (expired). The token itself is never logged or persisted
+    by this tool."""
+
+    def __init__(self, initial: str, renew_fn=None, source: str = ""):
+        self.token = (initial or "").strip()
+        self._renew_fn = renew_fn
+        self.source = source
+
+    def renew(self) -> bool:
+        if not self._renew_fn:
+            return False
+        fresh = self._renew_fn()
+        if fresh and fresh.strip() and fresh.strip() != self.token:
+            self.token = fresh.strip()
+            return True
+        return False
+
+
+def describe_token(token: str) -> str:
+    """Local peek at the JWT payload (no verification, nothing sent anywhere):
+    who it is for, which scopes, and when it expires. Never prints the token."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        import base64
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        who = claims.get("upn") or claims.get("preferred_username") or claims.get("app_displayname") or "?"
+        scopes = claims.get("scp", "?")
+        exp = claims.get("exp")
+        left = f", expires in ~{max(0, int(exp - time.time())) // 60} min" if exp else ""
+        return f"token for {who} (scopes: {scopes}{left})"
+    except Exception:
+        return "token accepted (not a decodable JWT — proceeding anyway)"
+
+
 def device_code_signin(tenant: str, client_id: str) -> str:
     """Returns an access token. Interactive: prints the code, waits for the user."""
     dc = _post_form(f"{LOGIN}/{tenant}/oauth2/v2.0/devicecode",
@@ -135,14 +172,24 @@ def device_code_signin(tenant: str, client_id: str) -> str:
         _fail_signin("sign-in", tok, tenant, client_id)
 
 
-def fetch_json(url: str, token: str, retries: int = 6) -> dict:
-    """GET with bearer auth, honoring Retry-After on throttle/transient errors."""
+def fetch_json(url: str, provider: TokenProvider, retries: int = 6) -> dict:
+    """GET with bearer auth: honors Retry-After on throttling, and on 401 (token
+    expired — pasted tokens live ~1 h) asks the provider for a fresh one and retries
+    the same URL, so a long delta crawl resumes exactly where it was."""
+    renewed = False
     for attempt in range(retries):
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {provider.token}"})
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
+            if e.code == 401 and not renewed:
+                print("\n  token expired or rejected (401)", file=sys.stderr)
+                if provider.renew():
+                    renewed = True
+                    continue
+                sys.exit("  no way to renew this token — rerun with a fresh one "
+                         f"({provider.source or 'see --help'})")
             if e.code in (429, 503, 504) and attempt < retries - 1:
                 wait = int(e.headers.get("Retry-After", "5") or "5")
                 print(f"\n  throttled ({e.code}) — waiting {wait}s", file=sys.stderr)
@@ -161,14 +208,14 @@ def iso_to_ns(s: str | None) -> int | None:
         return None
 
 
-def crawl(token: str, fetch=fetch_json) -> tuple[dict, list[dict], str | None]:
+def crawl(provider, fetch=fetch_json) -> tuple[dict, list[dict], str | None]:
     """(drive info, all items, deltaLink). fetch is injectable for tests."""
-    drive = fetch(f"{GRAPH}/me/drive?$select=id,driveType,name,owner,quota", token)
+    drive = fetch(f"{GRAPH}/me/drive?$select=id,driveType,name,owner,quota", provider)
     items: list[dict] = []
     url = f"{GRAPH}/me/drive/root/delta?$select={SELECT}&$top=999"
     delta_link = None
     while url:
-        page = fetch(url, token)
+        page = fetch(url, provider)
         items.extend(page.get("value", []))
         print(f"\r  {len(items):,} items fetched", end="", flush=True)
         url = page.get("@odata.nextLink")
@@ -281,14 +328,49 @@ def main(argv=None) -> int:
                    help="'common' (default), 'consumers', 'organizations', or a tenant id")
     p.add_argument("--client-id", default=DEFAULT_CLIENT_ID,
                    help="Entra public-client app id (default: Microsoft Graph Command Line Tools)")
+    p.add_argument("--token-file", default=None, metavar="PATH",
+                   help="use a bearer token from this file instead of signing in — e.g. copied "
+                        "from Graph Explorer's 'Access token' tab (the escape hatch when your "
+                        "tenant blocks app registrations). On expiry you'll be prompted to "
+                        "update the file and the crawl resumes where it was.")
+    p.add_argument("--paste-token", action="store_true",
+                   help="like --token-file but pasted interactively; nothing touches disk")
     p.add_argument("--top", type=int, default=100)
     p.add_argument("--sort", default=DEFAULT_SORT)
     args = p.parse_args(argv)
     sort_spec = parse_sort(args.sort)
 
-    token = device_code_signin(args.tenant, args.client_id)
-    print("  signed in (token held in memory only); enumerating…")
-    drive, items, delta_link = crawl(token)
+    if args.token_file:
+        path = os.path.abspath(args.token_file)
+
+        def read_file_token(first=[True]):
+            if not first[0]:
+                input(f"\n  paste a fresh token into {path}\n"
+                      f"  (Graph Explorer > sign in > 'Access token' tab > copy), save, "
+                      f"then press Enter… ")
+            first[0] = False
+            try:
+                with open(path, encoding="utf-8-sig") as f:
+                    return f.read().strip()
+            except OSError as e:
+                sys.exit(f"cannot read token file: {e}")
+
+        provider = TokenProvider(read_file_token(), renew_fn=read_file_token,
+                                 source=f"update {path}")
+    elif args.paste_token:
+        def ask_token():
+            return input("\n  paste the access token (input stays in memory): ").strip()
+        provider = TokenProvider(ask_token(), renew_fn=ask_token, source="paste a fresh token")
+    else:
+        provider = TokenProvider(
+            device_code_signin(args.tenant, args.client_id),
+            renew_fn=lambda: device_code_signin(args.tenant, args.client_id),
+            source="device-code sign-in")
+    if not provider.token:
+        sys.exit("empty token")
+    print(f"  {describe_token(provider.token)}")
+    print("  (held in memory only; every request is read-only metadata); enumerating…")
+    drive, items, delta_link = crawl(provider)
 
     db_path = os.path.abspath(args.db or os.path.join(
         os.path.dirname(os.path.abspath(__file__)),

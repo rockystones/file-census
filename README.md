@@ -267,6 +267,34 @@ python qccloud.py --tenant consumers --client-id <application-client-id>
 Your own registration is also the better long-term choice for the work account:
 consent, audit trail, and revocation all sit under an app you control.
 
+### Blocked from registering? Borrow Graph Explorer's token
+
+Some tenants (universities especially) block user app registrations but still
+allow Microsoft's own **Graph Explorer** (https://aka.ms/ge). If signing in
+there and running `GET /me/drive/root/children` works, you have everything you
+need — Graph Explorer will show you its bearer token, and this tool can run on
+it:
+
+1. In Graph Explorer, sign in and run any `/me/drive` request once (consent
+   `Files.Read` if prompted).
+2. Open the **Access token** tab, copy the token, save it to a file *outside
+   any repo or synced folder* (e.g. `%TEMP%\token.txt`).
+3. Run:
+
+```
+python qccloud.py --token-file %TEMP%\token.txt
+```
+
+`--paste-token` does the same interactively with nothing written to disk.
+The tool prints who the token is for, its scopes, and its remaining lifetime
+(decoded locally), then crawls. Tokens live ~1 hour; if one expires mid-crawl
+you are prompted to paste a fresh one and **the crawl resumes exactly where it
+was** (the delta feed's next-link is retried, not restarted). Delete the token
+file afterwards — it is a real credential for its remaining minutes, scoped to
+whatever Graph Explorer was consented. The same route works for personal
+accounts, so it also covers the case where you'd rather not register an app at
+all.
+
 Catalogs a OneDrive **from the cloud side** via Microsoft Graph — the local
 filesystem is never touched, so hydration cannot occur, and online-only files
 are covered by definition. Safety model: delegated device-code sign-in with
