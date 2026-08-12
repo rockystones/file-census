@@ -265,13 +265,17 @@ def run_viewer(db_path: str | None):
     def node_row(entry_id: int):
         r = state["model"].info[entry_id]
         if r["is_dir"]:
-            icon = "🔗 " if r["reparse_tag"] else "📁 "
-            typ = "junction" if r["reparse_tag"] == 0xA0000003 else (
-                "symlink" if r["reparse_tag"] else "folder")
+            # enumerated reparse dirs (cloud placeholder folders — imported OneDrive
+            # trees are reparse all the way down) behave as folders; a tag WITHOUT
+            # children is a real junction/symlink that was never descended
+            has_kids = bool(state["model"].children.get(entry_id))
+            link_like = r["reparse_tag"] and not has_kids
+            icon = "🔗 " if link_like else "📁 "
+            typ = ("junction" if r["reparse_tag"] == 0xA0000003 else "symlink") if link_like \
+                else "folder"
             agg = state["model"].agg.get(entry_id, [0, 0])
-            size, items = ("" if r["reparse_tag"] else human(agg[0]),
-                           "" if r["reparse_tag"] else f"{agg[1]:,}")
-            has_kids = bool(state["model"].children.get(entry_id)) and not r["reparse_tag"]
+            size, items = ("" if link_like else human(agg[0]),
+                           "" if link_like else f"{agg[1]:,}")
         else:
             icon = ""
             typ = r["ext"] or "file"

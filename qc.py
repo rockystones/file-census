@@ -967,13 +967,16 @@ def summarize_scan(con: sqlite3.Connection, scan_id: int) -> list[dict]:
             "size": r["size_bytes"] or 0, "files": 0 if r["is_dir"] else 1,
             "types": Counter(), "levels": Counter(),
         }
-        if r["is_dir"] and not r["reparse_tag"]:
+        # A reparse-tagged dir WITH catalogued children was enumerated (cloud placeholder
+        # folders carry the reparse attribute; OneDrive trees are reparse all the way
+        # down) — roll it up like any folder. Tag without children = a real link.
+        if r["is_dir"] and (not r["reparse_tag"] or children.get(r["entry_id"])):
             stack = [r["entry_id"]]
             while stack:
                 for c in children.get(stack.pop(), ()):
                     if c["is_dir"]:
                         item["levels"][c["depth"]] += 1  # depth 2 == "lv2" under a first-level folder
-                        if not c["reparse_tag"]:
+                        if not c["reparse_tag"] or children.get(c["entry_id"]):
                             stack.append(c["entry_id"])
                     else:
                         item["files"] += 1
@@ -1043,13 +1046,14 @@ def write_summary(con: sqlite3.Connection, scan_ids: list[int], txt_path: str, t
 
         rows = []
         for it in shown:
-            if it["reparse"]:
+            enumerated = it["is_dir"] and (it["files"] > 0 or it["levels"])
+            if it["reparse"] and not enumerated:
                 typ = "junction" if it["reparse"] == 0xA0000003 else "symlink"
             elif it["is_dir"]:
                 typ = "folder"
             else:
                 typ = it["ext"] or "file"
-            if it["is_dir"] and not it["reparse"]:
+            if it["is_dir"] and (not it["reparse"] or enumerated):
                 top_types = "  ".join(f"{e}×{n}" for e, n in it["types"].most_common(4))
                 more = len(it["types"]) - 4
                 if more > 0:
