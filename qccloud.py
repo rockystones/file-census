@@ -176,6 +176,8 @@ def fetch_json(url: str, provider: TokenProvider, retries: int = 6) -> dict:
     """GET with bearer auth: honors Retry-After on throttling, and on 401 (token
     expired — pasted tokens live ~1 h) asks the provider for a fresh one and retries
     the same URL, so a long delta crawl resumes exactly where it was."""
+    if not url.startswith(GRAPH.rsplit("/", 1)[0] + "/"):
+        sys.exit(f"refusing to send the bearer token to a non-Graph URL: {url[:80]}")
     renewed = False
     for attempt in range(retries):
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {provider.token}"})
@@ -358,8 +360,11 @@ def main(argv=None) -> int:
         provider = TokenProvider(read_file_token(), renew_fn=read_file_token,
                                  source=f"update {path}")
     elif args.paste_token:
+        import getpass
+
         def ask_token():
-            return input("\n  paste the access token (input stays in memory): ").strip()
+            # getpass, not input(): the token must not echo into the console scrollback
+            return getpass.getpass("\n  paste the access token (hidden; stays in memory): ").strip()
         provider = TokenProvider(ask_token(), renew_fn=ask_token, source="paste a fresh token")
     else:
         provider = TokenProvider(
