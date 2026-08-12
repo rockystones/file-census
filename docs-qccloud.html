@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qccloud.py — how it works, and how it is safe</title>
+<style>
+:root {
+  --bg:#fbfbfc; --fg:#1c2128; --dim:#59636e; --line:#d3d9df; --panel:#f1f4f7;
+  --acc:#0b6bcb; --accent-soft:#e3eefc; --code-bg:#f4f6f8; --warn:#9a6700; --ok:#1a7f37;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#14161a; --fg:#d7dae0; --dim:#8a919e; --line:#2c313a; --panel:#1d2026;
+          --acc:#5aa7e8; --accent-soft:#16273a; --code-bg:#1a1d22; --warn:#e8b45a; --ok:#6ac26a; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg);
+       font:15px/1.6 "Segoe UI", system-ui, sans-serif; }
+main { max-width: 920px; margin: 0 auto; padding: 28px 24px 80px; }
+h1 { font-size: 24px; margin: 8px 0 4px; }
+h2 { font-size: 19px; margin: 40px 0 10px; padding-top: 18px; border-top: 1px solid var(--line); }
+h3 { font-size: 15.5px; margin: 22px 0 6px; }
+p, li { max-width: 78ch; }
+.sub { color: var(--dim); margin: 0 0 18px; }
+code, pre { font-family: Consolas, "Cascadia Mono", monospace; font-size: 13.5px; }
+code { background: var(--code-bg); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+pre { background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
+      padding: 14px 16px; overflow-x: auto; line-height: 1.5; }
+pre code { background: none; border: none; padding: 0; }
+table { border-collapse: collapse; width: 100%; margin: 10px 0 18px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--dim); font-weight: 600; }
+td:first-child { white-space: nowrap; font-family: Consolas, monospace; font-size: 13.5px; }
+.note { background: var(--accent-soft); border-left: 3px solid var(--acc);
+        border-radius: 0 8px 8px 0; padding: 10px 14px; margin: 14px 0; }
+figure { margin: 20px 0; }
+figure svg { width: 100%; height: auto; display: block; }
+figcaption { color: var(--dim); font-size: 13px; margin-top: 6px; }
+.svgbox   { fill: var(--panel); stroke: var(--line); stroke-width: 1.2; rx: 8; }
+.svgboxa  { fill: var(--accent-soft); stroke: var(--acc); stroke-width: 1.2; rx: 8; }
+.svgboxg  { fill: none; stroke: var(--ok); stroke-width: 1.4; stroke-dasharray: 5 4; rx: 10; }
+.svgtxt   { fill: var(--fg); font: 13px "Segoe UI", system-ui, sans-serif; }
+.svgtxts  { fill: var(--dim); font: 11.5px "Segoe UI", system-ui, sans-serif; }
+.svgtxtg  { fill: var(--ok); font: 12px "Segoe UI", system-ui, sans-serif; font-weight: 600; }
+.svgline  { stroke: var(--dim); stroke-width: 1.4; fill: none; }
+.svghead  { fill: var(--dim); }
+</style>
+</head>
+<body>
+<main>
+
+<h1>qccloud.py — how it works, and how it is safe</h1>
+<p class="sub">One Python file (standard library only) that censuses a OneDrive <strong>from
+the cloud side</strong> via Microsoft Graph, into the same SQLite catalog schema the local
+tools use. The local filesystem is never touched — so placeholder hydration cannot occur —
+and no file content is ever downloaded. Its unique contribution: every file arrives with a
+<strong>service-computed hash</strong> (<code>quickXorHash</code>), giving content-grade
+duplicate detection with zero bytes read. Output opens in qcview, diffs scan-vs-scan, and
+feeds the same analyses as any disk census.</p>
+
+<!-- ============================================================ -->
+<h2>1 · The building blocks</h2>
+
+<table>
+<tr><th>Piece</th><th>What it does for qccloud.py</th></tr>
+<tr><td>urllib.request</td>
+<td>The whole HTTP layer — no third-party dependencies to trust. Exactly two request
+shapes exist: form-encoded POSTs to <code>login.microsoftonline.com</code> (the optional
+device-code sign-in only), and GETs with a bearer header to
+<code>graph.microsoft.com</code>. TLS certificate verification is Python's default —
+no custom SSL context exists anywhere in the file to weaken it.</td></tr>
+<tr><td>Graph: /me/drive</td>
+<td>One call for identity and capacity: the drive's stable <code>id</code> (recorded as
+the catalog's volume serial), <code>driveType</code> (personal/business), owner, and the
+<code>quota</code> block (plan size, used, remaining — the cloud analog of disk
+total/free). Note <code>quota.used</code> includes document version history, so it
+normally exceeds the visible file tree's byte sum.</td></tr>
+<tr><td>Graph: /root/delta</td>
+<td>The enumeration engine — the same feed sync clients use. It returns <em>every item in
+the drive</em> as a flat, arbitrarily-ordered stream of pages: follow
+<code>@odata.nextLink</code> until a final <code>@odata.deltaLink</code> appears. That
+last link is a resume cursor: stored in the catalog, it makes a future re-census
+incremental (changes only). The <code>$select</code> trims each item to exactly the
+census fields — and deliberately <strong>excludes <code>downloadUrl</code></strong>, so
+no response ever contains a pre-authenticated link to file content.</td></tr>
+<tr><td>quickXorHash</td>
+<td>OneDrive's content hash, computed by Microsoft's servers as files are stored, and
+returned inline as metadata (<code>file.hashes.quickXorHash</code>). This is the piece no
+local metadata scan can match: proof-grade content identity for hundreds of thousands of
+files without reading one byte. It lands in the catalog's <code>entry.hash</code> column
+(local scans leave it NULL). To compare against a <em>local</em> file, compute
+quickXorHash on that local file — a cheap local read, still no downloads.</td></tr>
+<tr><td>json + base64</td>
+<td>Response parsing, plus one local trick: <code>describe_token()</code> decodes the
+middle segment of the JWT <em>locally</em> to show who the token belongs to, its scopes,
+and minutes to expiry. Nothing is sent anywhere for this, and the token itself is never
+printed — only those derived claims.</td></tr>
+<tr><td>getpass</td>
+<td>Hidden interactive token entry for <code>--paste-token</code>: the pasted credential
+is not echoed, so it never lands in the console scrollback buffer.</td></tr>
+<tr><td>imported from qc.py</td>
+<td><code>open_db</code> (shared schema + migrations), <code>write_summary</code> (the
+same .txt report), <code>suggest_db_name</code>, <code>human</code>, <code>parse_sort</code>
+— a cloud census is a first-class catalog, not a special case.</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>2 · What it defines, and how the values move</h2>
+
+<h3>Getting a token — three doors, one holder</h3>
+<table>
+<tr><th>Function</th><th>Purpose and data in/out</th></tr>
+<tr><td>TokenProvider</td>
+<td>The single place a credential lives: one string held in process memory, plus a
+<code>renew()</code> hook invoked when Graph answers 401 (tokens live ~1 hour). Renewal
+that returns the same stale token is treated as failure — no infinite 401 loop.</td></tr>
+<tr><td>--token-file / --paste-token</td>
+<td>The "borrowed token" doors, built for tenants that block app registrations but allow
+Graph Explorer: you copy the token Graph Explorer already holds and hand it over — from a
+file the tool only ever <em>reads</em>, or via hidden paste. On expiry you're prompted
+for a fresh one and the crawl <em>resumes in place</em>.</td></tr>
+<tr><td>device_code_signin(tenant, client_id)</td>
+<td>The self-service door: OAuth device-code flow. Prints a URL + short code, you sign in
+on Microsoft's page (the tool never sees a password), it polls the token endpoint until
+approved. Scope requested: <code>Files.Read</code> only, with <em>no</em>
+<code>offline_access</code> — so no refresh token ever exists to leak. Requires a client
+id the tenant accepts (your own registration, since Microsoft's first-party CLI id is
+unavailable to personal accounts and uninstalled in some org tenants).</td></tr>
+<tr><td>_signin_guidance(...)</td>
+<td>Translates raw AADSTS sign-in errors into the next thing to try — the rules were
+learned from real failures: device codes need a <em>concrete</em> tenant
+(<code>consumers</code> or a named domain; <code>common</code>/<code>organizations</code>
+always fail with 50059), personal accounts always need your own app (700016 in the MSA
+directory), a work 700016 means the tenant resolved and only the client is missing, and
+7000218 means the registration forgot "Allow public client flows".</td></tr>
+<tr><td>describe_token(token)</td>
+<td>Local JWT peek printed at startup: <code>token for you@pitt.edu (scopes: …, expires
+in ~58 min)</code>. Unit-tested to never contain the token string itself.</td></tr>
+</table>
+
+<figure>
+<svg viewBox="0 0 900 250" role="img" aria-label="Token flow and request pinning">
+  <defs><marker id="c1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" class="svghead"/></marker></defs>
+  <rect x="8"   y="14" width="168" height="44" class="svgbox"/>
+  <text x="92"  y="32" text-anchor="middle" class="svgtxt">--token-file</text>
+  <text x="92"  y="48" text-anchor="middle" class="svgtxts">read-only; you delete it after</text>
+  <rect x="8"   y="66" width="168" height="44" class="svgbox"/>
+  <text x="92"  y="84" text-anchor="middle" class="svgtxt">--paste-token</text>
+  <text x="92"  y="100" text-anchor="middle" class="svgtxts">getpass: no echo, no scrollback</text>
+  <rect x="8"   y="118" width="168" height="44" class="svgbox"/>
+  <text x="92"  y="136" text-anchor="middle" class="svgtxt">device-code sign-in</text>
+  <text x="92"  y="152" text-anchor="middle" class="svgtxts">Files.Read, no refresh token</text>
+  <path d="M176 36 L226 74" class="svgline" marker-end="url(#c1)"/>
+  <path d="M176 88 L226 88" class="svgline" marker-end="url(#c1)"/>
+  <path d="M176 140 L226 102" class="svgline" marker-end="url(#c1)"/>
+  <rect x="228" y="62" width="172" height="52" class="svgboxa"/>
+  <text x="314" y="82" text-anchor="middle" class="svgtxt">TokenProvider</text>
+  <text x="314" y="98" text-anchor="middle" class="svgtxts">memory only · renew() on 401</text>
+  <path d="M400 88 L456 88" class="svgline" marker-end="url(#c1)"/>
+  <rect x="458" y="56" width="200" height="64" class="svgbox"/>
+  <text x="558" y="76" text-anchor="middle" class="svgtxt">fetch_json</text>
+  <text x="558" y="92" text-anchor="middle" class="svgtxts">URL pin: graph.microsoft.com only</text>
+  <text x="558" y="106" text-anchor="middle" class="svgtxts">GET + bearer header · Retry-After</text>
+  <path d="M658 88 L716 88" class="svgline" marker-end="url(#c1)"/>
+  <rect x="718" y="56" width="172" height="64" class="svgbox"/>
+  <text x="804" y="76" text-anchor="middle" class="svgtxt">Microsoft Graph</text>
+  <text x="804" y="92" text-anchor="middle" class="svgtxts">HTTPS, default cert verify</text>
+  <text x="804" y="106" text-anchor="middle" class="svgtxts">scopes enforced server-side</text>
+  <path d="M558 120 C 500 170, 380 170, 318 118" class="svgline" marker-end="url(#c1)"/>
+  <text x="438" y="172" text-anchor="middle" class="svgtxts">401 (expired) → renew → SAME url retried: the crawl resumes in place</text>
+  <rect x="228" y="196" width="430" height="30" class="svgboxg"/>
+  <text x="443" y="215" text-anchor="middle" class="svgtxtg">never printed · never logged · never written to disk · path-only on the command line</text>
+</svg>
+<figcaption>Figure 1 — three doors, one holder, one exit. A single line of code attaches the
+credential, and it refuses any destination that is not Microsoft Graph.</figcaption>
+</figure>
+
+<h3>Crawling and building — a flat feed becomes a tree</h3>
+<table>
+<tr><th>Function</th><th>Purpose and data in/out</th></tr>
+<tr><td>fetch_json(url, provider)</td>
+<td>The only authenticated request path. Refuses non-Graph URLs before building a request
+(so even a tampered next-link could not redirect the token), honors
+<code>Retry-After</code> on 429/503/504 with bounded retries, and on 401 renews and
+retries the <em>same</em> URL — which is what lets a multi-hour crawl outlive its
+one-hour tokens without losing its place.</td></tr>
+<tr><td>crawl(provider)</td>
+<td>One <code>/me/drive</code> call, then the delta loop: accumulate every page's items,
+follow <code>nextLink</code>, stop at <code>deltaLink</code>. Returns (drive info, flat
+item list, resume cursor). Progress prints a running item count.</td></tr>
+<tr><td>build_catalog(con, drive, items, deltaLink)</td>
+<td>The flat feed arrives in arbitrary order, so the tree is built by identifiers, not
+sequence: index items by <code>id</code>, group children by
+<code>parentReference.id</code>, anchor on the one item carrying the <code>root</code>
+facet, then walk top-down assigning entry ids and depths. Items whose parent never
+appears (shared oddities) attach under the root with a printed note rather than being
+dropped. Files carry size, timestamps (<code>fileSystemInfo</code> — the filesystem
+dates, not upload dates), extension, and the hash. The scan row records
+<code>platform='cloud'</code>, the drive id as the volume serial, owner as the drive
+name, and quota as disk totals. The deltaLink lands in a small <code>cloud_state</code>
+table keyed by drive id.</td></tr>
+<tr><td>main(argv)</td>
+<td>Token-source precedence (file &gt; paste &gt; device-code), then crawl → build →
+the same summary .txt every census gets. Default catalog name follows the
+<code>census_onedrive_…</code> convention beside the script.</td></tr>
+</table>
+
+<figure>
+<svg viewBox="0 0 900 210" role="img" aria-label="Delta crawl to catalog">
+  <defs><marker id="c2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" class="svghead"/></marker></defs>
+  <rect x="8" y="20" width="150" height="48" class="svgbox"/>
+  <text x="83" y="40" text-anchor="middle" class="svgtxt">GET /me/drive</text>
+  <text x="83" y="56" text-anchor="middle" class="svgtxts">id, type, owner, quota</text>
+  <path d="M158 44 L206 44" class="svgline" marker-end="url(#c2)"/>
+  <rect x="208" y="20" width="196" height="48" class="svgboxa"/>
+  <text x="306" y="40" text-anchor="middle" class="svgtxt">GET /root/delta?$select=…</text>
+  <text x="306" y="56" text-anchor="middle" class="svgtxts">no downloadUrl in $select — ever</text>
+  <path d="M404 44 L452 44" class="svgline" marker-end="url(#c2)"/>
+  <rect x="454" y="20" width="136" height="48" class="svgbox"/>
+  <text x="522" y="40" text-anchor="middle" class="svgtxt">items += page</text>
+  <text x="522" y="56" text-anchor="middle" class="svgtxts">flat, any order</text>
+  <path d="M522 68 C 522 108, 306 108, 306 70" class="svgline" marker-end="url(#c2)"/>
+  <text x="414" y="102" text-anchor="middle" class="svgtxts">@odata.nextLink (repeat until deltaLink)</text>
+  <path d="M590 44 L640 44" class="svgline" marker-end="url(#c2)"/>
+  <rect x="642" y="8" width="248" height="76" class="svgbox"/>
+  <text x="766" y="28" text-anchor="middle" class="svgtxt">build tree by ids</text>
+  <text x="766" y="44" text-anchor="middle" class="svgtxts">root facet = anchor · children by parent id</text>
+  <text x="766" y="58" text-anchor="middle" class="svgtxts">orphans → under root, with a note</text>
+  <text x="766" y="72" text-anchor="middle" class="svgtxts">quickXorHash → entry.hash</text>
+  <path d="M766 84 L766 122" class="svgline" marker-end="url(#c2)"/>
+  <rect x="560" y="124" width="330" height="56" class="svgbox"/>
+  <text x="725" y="144" text-anchor="middle" class="svgtxt">catalog: scan (platform='cloud', quota) + entries</text>
+  <text x="725" y="160" text-anchor="middle" class="svgtxts">cloud_state.deltaLink = resume cursor for incremental re-census</text>
+  <text x="725" y="174" text-anchor="middle" class="svgtxts">then the standard summary .txt — same as any census</text>
+</svg>
+<figcaption>Figure 2 — the delta feed is consumed flat and rebuilt into the shared catalog
+schema; the parting deltaLink makes the next census incremental.</figcaption>
+</figure>
+
+<!-- ============================================================ -->
+<h2>3 · Pseudo-code: the whole program on one screen</h2>
+
+<pre><code>main:
+    provider = first available of:
+        --token-file  -&gt; read file (tool never writes it); renew = re-read after prompt
+        --paste-token -&gt; getpass (hidden); renew = ask again
+        otherwise     -&gt; device-code sign-in (Files.Read, no refresh token);
+                         renew = run the flow again
+    print describe_token(provider.token)      # who / scopes / expiry — never the token
+
+crawl:
+    drive = GET /me/drive ($select: id, driveType, owner, quota)
+    url = /me/drive/root/delta?$select=id,name,size,parentReference,
+                                       file,folder,fileSystemInfo,root&$top=999
+    while url:
+        page = fetch(url)                     # see fetch below
+        items += page.value
+        url = page.nextLink                   # absent on the last page
+    deltaLink = page.deltaLink                # resume cursor for next time
+
+fetch(url):
+    refuse unless url starts with https://graph.microsoft.com/   # token cannot leave Graph
+    GET with Authorization: Bearer &lt;token&gt;    # the ONLY authenticated line
+    on 429/503/504: sleep Retry-After, retry (bounded)
+    on 401: provider.renew(); retry the SAME url once   # crawl resumes in place
+
+build_catalog:
+    index items by id;  children[parent id] += item;  root = the item with the root facet
+    walk top-down from root assigning entry ids and depths
+        folder -&gt; dir row (timestamps from fileSystemInfo)
+        file   -&gt; file row + size + ext + quickXorHash into entry.hash
+        parent never seen -&gt; attach under root, print a note
+    scan row: drive='onedrive:&lt;owner&gt;', platform='cloud',
+              serial = drive id, disk totals = quota
+    store deltaLink in cloud_state;  write the standard summary .txt
+</code></pre>
+
+<!-- ============================================================ -->
+<h2>4 · The safety model — audited, with the honest limits</h2>
+
+<p><strong>Claims about the tool</strong> (each verified by reading the code and by unit
+tests, not asserted from intent):</p>
+<table>
+<tr><th>Guarantee</th><th>Why it holds</th></tr>
+<tr><td>read-only, twice over</td>
+<td>Every Graph request is a GET; the only POSTs are the sign-in handshake at
+login.microsoftonline.com. Independently, the server enforces the token's scopes — the
+tool could not write even if it tried with a read-only token.</td></tr>
+<tr><td>no content, no hydration</td>
+<td>The <code>$select</code> excludes <code>downloadUrl</code>, so responses never even
+contain a link to file content; and the local filesystem is never touched, so cloud
+placeholders cannot hydrate. Nothing is downloaded — hashes come precomputed.</td></tr>
+<tr><td>token goes one place</td>
+<td>A single line attaches the credential, and <code>fetch_json</code> refuses any URL
+outside <code>graph.microsoft.com</code> before building a request — a tampered
+next-link could not steer the token elsewhere. Tested against a hostile URL.</td></tr>
+<tr><td>token is never persisted</td>
+<td>The only <code>open()</code> on the token path is read-mode. Nothing writes it;
+error paths print server responses and status codes, never request headers;
+<code>describe_token</code> output is unit-tested to not contain it. The command line
+carries only a file <em>path</em>, so process listings reveal nothing, and
+<code>--paste-token</code> uses hidden input so the console scrollback stays clean.</td></tr>
+<tr><td>no supply chain</td>
+<td>Standard library only, ~400 lines, one file — auditable in a sitting, and the public
+repo history shows exactly what runs.</td></tr>
+<tr><td>what does persist</td>
+<td>The catalog (filenames, sizes, dates, hashes — sensitive the way every census
+catalog is; gitignored) and the <code>deltaLink</code> cursor, which is a resume
+position, not a credential.</td></tr>
+</table>
+
+<p><strong>Honest limits — the risks that live around the token, not in the code:</strong></p>
+<ul>
+<li><strong>A borrowed Graph Explorer token carries Graph Explorer's full consented
+scopes</strong> — likely more than Files.Read. This tool only reads metadata, but the
+token itself is a ~1-hour capability for anything those scopes allow, in anyone's hands.
+Expiry is the backstop: signing out of Graph Explorer does <em>not</em> revoke
+already-issued tokens.</li>
+<li><strong>The clipboard is the sneakiest copy.</strong> With Windows clipboard history
+enabled (Win+V), the copied token sits in it after you paste. Clear it when done.</li>
+<li><strong>The token file is your custody.</strong> Keep it out of repos and synced
+folders (a token synced to OneDrive by OneDrive would be a poetic failure), delete it
+after the run; the repo's .gitignore blocks <code>token.txt</code>/<code>*.token</code>
+as a backstop.</li>
+<li><strong>Process memory is not scrubbable.</strong> Python strings live in the heap
+until exit; a crash dump or swap could theoretically expose the token during its
+lifetime. Bounded by the short process life and the token's own expiry.</li>
+<li><strong>Nothing defends a compromised machine.</strong> Anything running as you can
+do what you can do.</li>
+</ul>
+
+<div class="note">
+<strong>The four-minute ritual:</strong> copy the token → save to <code>%TEMP%\token.txt</code>
+(never a synced folder) → run the crawl → delete the file → clear clipboard history.
+A one-hour credential, handled for minutes, exercised through a single pinned, read-only,
+audit-visible request path.</div>
+
+<p class="sub">Companion docs: docs.html (qc.py internals) · README.md (usage, tenant
+guidance, app registration, the Graph Explorer token route). Generated 2026-08-12.</p>
+
+</main>
+</body>
+</html>

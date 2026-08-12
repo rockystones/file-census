@@ -215,8 +215,12 @@ files, same sizes, same timestamps to the nanosecond.
 
 ```
 python qccloud.py                     # device-code sign-in, census /me/drive
-python qccloud.py --tenant organizations --client-id <your-app-guid>
+python qccloud.py --token-file %TEMP%\token.txt   # borrowed Graph Explorer token
 ```
+
+**[docs-qccloud.html](docs-qccloud.html)** is the implementation walkthrough —
+how the token flows, how the delta crawl builds the catalog, and the audited
+safety model with its honest limits.
 
 ### Choosing the tenant
 
