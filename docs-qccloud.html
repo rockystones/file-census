@@ -112,8 +112,11 @@ same .txt report), <code>suggest_db_name</code>, <code>human</code>, <code>parse
 <tr><th>Function</th><th>Purpose and data in/out</th></tr>
 <tr><td>TokenProvider</td>
 <td>The single place a credential lives: one string held in process memory, plus a
-<code>renew()</code> hook invoked when Graph answers 401 (tokens live ~1 hour). Renewal
-that returns the same stale token is treated as failure — no infinite 401 loop.</td></tr>
+<code>renew()</code> hook invoked when Graph answers 401 — on expiry (classic tokens:
+~1 hour) or on early revocation (long-lived CAE tokens are revocable mid-life; a real
+crawl saw one rejected at hour 5 of a claimed 23, so the printed expiry is an upper
+bound). Renewal that returns the same stale token is treated as failure — no infinite
+401 loop.</td></tr>
 <tr><td>--token-file / --paste-token</td>
 <td>The "borrowed token" doors, built for tenants that block app registrations but allow
 Graph Explorer: you copy the token Graph Explorer already holds and hand it over — from a
@@ -183,8 +186,8 @@ credential, and it refuses any destination that is not Microsoft Graph.</figcapt
 <td>The only authenticated request path. Refuses non-Graph URLs before building a request
 (so even a tampered next-link could not redirect the token), honors
 <code>Retry-After</code> on 429/503/504 with bounded retries, and on 401 renews and
-retries the <em>same</em> URL — which is what lets a multi-hour crawl outlive its
-one-hour tokens without losing its place.</td></tr>
+retries the <em>same</em> URL — which is what lets a long crawl outlive its tokens,
+whether they expire on schedule or get revoked early, without losing its place.</td></tr>
 <tr><td>crawl(provider)</td>
 <td>One <code>/me/drive</code> call, then the delta loop: follow <code>nextLink</code>,
 stop at <code>deltaLink</code>. Each page is <strong>compacted on arrival</strong> to a
@@ -322,9 +325,14 @@ position, not a credential.</td></tr>
 <ul>
 <li><strong>A borrowed Graph Explorer token carries Graph Explorer's full consented
 scopes</strong> — likely more than Files.Read. This tool only reads metadata, but the
-token itself is a ~1-hour capability for anything those scopes allow, in anyone's hands.
-Expiry is the backstop: signing out of Graph Explorer does <em>not</em> revoke
-already-issued tokens.</li>
+token itself is a capability for anything those scopes allow, in anyone's hands, for as
+long as it stays valid: ~1 hour for classic tokens, up to ~24 hours for the CAE
+(Continuous Access Evaluation) tokens some tenants issue. Cuts both ways: a CAE token
+can also be <em>revoked</em> hours before its printed expiry (sign-out, policy, network
+change) — a real crawl had one rejected at hour 5 of a claimed 23 — so treat the
+printed lifetime as an upper bound in both the risk and the planning sense. For classic
+tokens, expiry is the only backstop: signing out of Graph Explorer does <em>not</em>
+revoke them.</li>
 <li><strong>The clipboard is the sneakiest copy.</strong> With Windows clipboard history
 enabled (Win+V), the copied token sits in it after you paste. Clear it when done.</li>
 <li><strong>The token file is your custody.</strong> Keep it out of repos and synced
@@ -339,10 +347,10 @@ do what you can do.</li>
 </ul>
 
 <div class="note">
-<strong>The four-minute ritual:</strong> copy the token → save to <code>%TEMP%\token.txt</code>
-(never a synced folder) → run the crawl → delete the file → clear clipboard history.
-A one-hour credential, handled for minutes, exercised through a single pinned, read-only,
-audit-visible request path.</div>
+<strong>The four-minute ritual:</strong> copy the token <em>fresh, right before the
+run</em> → save to <code>%TEMP%\token.txt</code> (never a synced folder) → run the crawl
+→ delete the file → clear clipboard history. A short-lived credential, handled for
+minutes, exercised through a single pinned, read-only, audit-visible request path.</div>
 
 <p class="sub">Companion docs: docs.html (qc.py internals) · README.md (usage, tenant
 guidance, app registration, the Graph Explorer token route). Generated 2026-08-12.</p>

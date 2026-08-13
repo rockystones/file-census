@@ -352,11 +352,17 @@ python qccloud.py --token-file %TEMP%\token.txt
 
 `--paste-token` does the same interactively with nothing written to disk.
 The tool prints who the token is for, its scopes, and its remaining lifetime
-(decoded locally), then crawls. Tokens live ~1 hour; if one expires mid-crawl
-you are prompted to paste a fresh one and **the crawl resumes exactly where it
-was** (the delta feed's next-link is retried, not restarted). Delete the token
-file afterwards — it is a real credential for its remaining minutes, scoped to
-whatever Graph Explorer was consented. The same route works for personal
+(decoded locally), then crawls. **Treat the printed expiry as an upper bound,
+not a promise**: classic tokens live ~1 hour, and the ~24-hour ones some
+tenants issue are CAE (Continuous Access Evaluation) tokens — revocable
+mid-life, so Graph may reject one hours before its stated expiry after a
+sign-out, password/policy event, or network change (observed in practice:
+rejected at hour 5 of a claimed 23). None of this loses work: copy the token
+fresh right before starting, and if a 401 arrives mid-crawl you are prompted
+to paste a fresh one and **the crawl resumes exactly where it was** (the delta
+feed's next-link is retried, not restarted). Delete the token file afterwards —
+it is a real credential for its remaining validity, scoped to whatever Graph
+Explorer was consented. The same route works for personal
 accounts, so it also covers the case where you'd rather not register an app at
 all.
 

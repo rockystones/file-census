@@ -146,7 +146,16 @@ def describe_token(token: str) -> str:
         who = claims.get("upn") or claims.get("preferred_username") or claims.get("app_displayname") or "?"
         scopes = claims.get("scp", "?")
         exp = claims.get("exp")
-        left = f", expires in ~{max(0, int(exp - time.time())) // 60} min" if exp else ""
+        left = ""
+        if exp:
+            mins = max(0, int(exp - time.time())) // 60
+            # A multi-hour expiry means a CAE token (xms_cc): revocable mid-life, so
+            # exp is an upper bound — Graph may 401 long before it (sign-out, policy,
+            # IP change). Proven on a real crawl: rejected at minute ~302 of 1394.
+            cap = (" — upper bound: revocable token, Graph may 401 sooner; "
+                   "the tool then prompts for a fresh one and resumes"
+                   if claims.get("xms_cc") or mins > 180 else "")
+            left = f", expires in ~{mins} min{cap}"
         return f"token for {who} (scopes: {scopes}{left})"
     except Exception:
         return "token accepted (not a decodable JWT — proceeding anyway)"
@@ -180,8 +189,9 @@ def device_code_signin(tenant: str, client_id: str) -> str:
 
 def fetch_json(url: str, provider: TokenProvider, retries: int = 6) -> dict:
     """GET with bearer auth: honors Retry-After on throttling, and on 401 (token
-    expired — pasted tokens live ~1 h) asks the provider for a fresh one and retries
-    the same URL, so a long delta crawl resumes exactly where it was."""
+    expired or revoked — classic tokens live ~1 h; long-lived CAE tokens can be
+    rejected mid-life at any policy event) asks the provider for a fresh one and
+    retries the same URL, so a long delta crawl resumes exactly where it was."""
     if not url.startswith(GRAPH.rsplit("/", 1)[0] + "/"):
         sys.exit(f"refusing to send the bearer token to a non-Graph URL: {url[:80]}")
     renewed = False
