@@ -187,6 +187,23 @@ def device_code_signin(tenant: str, client_id: str) -> str:
         _fail_signin("sign-in", tok, tenant, client_id)
 
 
+def _token_rejection_hint(body: str) -> str:
+    """Translate a Graph 401 body into the next thing to do, the way
+    _signin_guidance does for AADSTS sign-in errors. The big one: Continuous
+    Access Evaluation revoking a token mid-life with an InteractionRequired
+    challenge — seen on a real crawl as 'TokenCreatedWithOutdatedPolicies'."""
+    if ("ontinuous access evaluation" in body or "InteractionRequired" in body
+            or "TokenCreatedWithOutdatedPolicies" in body):
+        return ("\n  This token was revoked by Continuous Access Evaluation before its stated\n"
+                "  expiry (a tenant policy tick outdates every earlier token), and the challenge\n"
+                "  demands a fresh INTERACTIVE sign-in — no silent refresh can satisfy it, and\n"
+                "  Graph Explorer keeps showing its cached (revoked) token until it re-auths.\n"
+                "  Fix: in Graph Explorer sign OUT and back IN (an MFA prompt is the point),\n"
+                "  run any query there to confirm it works, check the Access token tab now\n"
+                "  shows a DIFFERENT string, then use that fresh token here.")
+    return ""
+
+
 def fetch_json(url: str, provider: TokenProvider, retries: int = 6) -> dict:
     """GET with bearer auth: honors Retry-After on throttling, and on 401 (token
     expired or revoked — classic tokens live ~1 h; long-lived CAE tokens can be
@@ -201,8 +218,13 @@ def fetch_json(url: str, provider: TokenProvider, retries: int = 6) -> dict:
             with urllib.request.urlopen(req, timeout=60) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", "replace")
+            except Exception:
+                body = ""
             if e.code == 401 and not renewed:
-                print("\n  token expired or rejected (401)", file=sys.stderr)
+                print("\n  token expired or rejected (401)" + _token_rejection_hint(body),
+                      file=sys.stderr)
                 if provider.renew():
                     renewed = True
                     continue
@@ -213,7 +235,8 @@ def fetch_json(url: str, provider: TokenProvider, retries: int = 6) -> dict:
                 print(f"\n  throttled ({e.code}) — waiting {wait}s", file=sys.stderr)
                 time.sleep(min(wait, 120))
                 continue
-            sys.exit(f"Graph request failed ({e.code}): {e.read()[:300]}")
+            sys.exit(f"Graph request failed ({e.code}): {body[:300]}"
+                     + _token_rejection_hint(body))
     sys.exit("Graph request failed after retries")
 
 
